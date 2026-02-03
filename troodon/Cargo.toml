@@ -4,3 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Наш Event Loop (runtime). Вмикаємо "full", щоб мати все: таймери, TCP, signal handling.
+tokio = { version = "1", features = ["full"] }
+
+# Наш Proxy Framework.
+# Features:
+# - "lb": Load Balancer (базові можливості проксі)
+# - "ssl": підтримка TLS/SSL (OpenSSL)
+pingora = { version = "0.7.0", features = ["lb", "proxy", "openssl"] }
+
+# Для логування (щоб бачити, що відбувається в консолі)
+env_logger = "0.11"
+log = "0.4"
+async-trait = "0.1"

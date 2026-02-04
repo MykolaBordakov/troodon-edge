@@ -34,6 +34,25 @@ impl ProxyHttp for LB {
         // Створюємо Peer з обраної IP
         let mut peer = Box::new(HttpPeer::new(upstream.addr, true, "one.one.one.one".to_string()));
         peer.sni = "one.one.one.one".to_string();
+        // --- SECURITY BLOCK START ---
+        // 1. Connection Timeout (5 сек)
+        // Скільки чекаємо на TCP Handshake + TLS Handshake.
+        // Якщо сервер "тупить" або лежить — кидаємо помилку, не висимо.
+        peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
+
+        // 2. Read Timeout (10 сек)
+        // TTFB (Time To First Byte) та час між отриманням пакетів даних.
+        // Захищає від повільних бекендів.
+        peer.options.read_timeout = Some(std::time::Duration::from_secs(10));
+
+        // 3. Write Timeout (10 сек)
+        // Скільки часу ми намагаємося відправити тіло запиту на бекенд.
+        peer.options.write_timeout = Some(std::time::Duration::from_secs(10));
+
+        // 4. Idle Timeout (30 сек)
+        // Це Keep-Alive. Скільки тримати з'єднання відкритим, якщо ніхто нічого не шле.
+        peer.options.idle_timeout = Some(std::time::Duration::from_secs(30));
+        // --- SECURITY BLOCK END ---
 
         Ok(peer)
     }
@@ -59,7 +78,10 @@ fn main() {
     my_server.bootstrap();
 
     // Створюємо список серверів (Health Check поки немає, просто список)
-    let upstreams = LoadBalancer::try_from_iter(["1.1.1.1:443", "1.0.0.1:443"]).unwrap();
+    let upstreams = LoadBalancer::try_from_iter(
+        ["1.1.1.1:443", 
+        "1.0.0.1:443"
+    ]).unwrap();
 
     // Ініціалізуємо сервіс
     let mut lb = http_proxy_service(&my_server.configuration, LB(Arc::new(upstreams)));

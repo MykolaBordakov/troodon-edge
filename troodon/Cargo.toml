@@ -12,8 +12,21 @@ tokio = { version = "1", features = ["full"] }
 # - "lb": Load Balancer (базові можливості проксі)
 # - "ssl": підтримка TLS/SSL (OpenSSL)
 pingora = { version = "0.7.0", features = ["lb", "proxy", "openssl"] }
-
 # Для логування (щоб бачити, що відбувається в консолі)
-env_logger = "0.11"
-log = "0.4"
 async-trait = "0.1"
+# === Logging (The "Zap" replacement) ===
+# tracing - це ядро (фасад)
+tracing = "0.1"
+# tracing-subscriber - це реалізація (пише в stdout, JSON, etc.)
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# log - потрібен для сумісності, бо Pingora пише в старий 'log' crate
+log = "0.4"
+
+# === Configuration (YAML Parsing) ===
+# serde - це фреймворк серіалізації (як encoding/json в Go)
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+# === Error Handling ===
+# Щоб простіше повертати помилки (Result<T, anyhow::Error>)
+anyhow = "1.0"

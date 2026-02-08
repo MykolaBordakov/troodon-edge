@@ -1,95 +1,76 @@
-use async_trait::async_trait;
+mod proxy;
+use proxy::LB;
+mod config;
 use pingora::prelude::*;
 use std::sync::Arc;
-use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
+//use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
 use pingora::lb::LoadBalancer;
-use pingora::lb::selection::RoundRobin;
+use tracing::{info, error, debug};
 
 // Наша структура, яка тримає балансувальник
-pub struct LB(Arc<LoadBalancer<RoundRobin>>);
 
-#[async_trait]
-impl ProxyHttp for LB {
-    // 1. Визначаємо тип контексту (обов'язково!)
-    type CTX = ();
-    
-    // 2. Створюємо контекст (обов'язково!)
-    fn new_ctx(&self) -> Self::CTX {
-        ()
-    }
-
-    // 3. Визначаємо, куди слати трафік (обов'язково!)
-    async fn upstream_peer(
-        &self,
-        _session: &mut Session,
-        _ctx: &mut Self::CTX,
-    ) -> Result<Box<HttpPeer>> {
-        // ВИКОРИСТОВУЄМО БАЛАНСУВАЛЬНИК
-        // self.0 — це доступ до першого елементу нашої структури (Arc<LoadBalancer>)
-        // select() обирає бекенд за алгоритмом RoundRobin
-        let upstream = self.0.select(b"", 256).unwrap();
-
-        println!(">> Load Balancer chose: {:?}", upstream.addr.as_inet());
-
-        // Створюємо Peer з обраної IP
-        let mut peer = Box::new(HttpPeer::new(upstream.addr, true, "one.one.one.one".to_string()));
-        peer.sni = "one.one.one.one".to_string();
-        // --- SECURITY BLOCK START ---
-        // 1. Connection Timeout (5 сек)
-        // Скільки чекаємо на TCP Handshake + TLS Handshake.
-        // Якщо сервер "тупить" або лежить — кидаємо помилку, не висимо.
-        peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
-
-        // 2. Read Timeout (10 сек)
-        // TTFB (Time To First Byte) та час між отриманням пакетів даних.
-        // Захищає від повільних бекендів.
-        peer.options.read_timeout = Some(std::time::Duration::from_secs(10));
-
-        // 3. Write Timeout (10 сек)
-        // Скільки часу ми намагаємося відправити тіло запиту на бекенд.
-        peer.options.write_timeout = Some(std::time::Duration::from_secs(10));
-
-        // 4. Idle Timeout (30 сек)
-        // Це Keep-Alive. Скільки тримати з'єднання відкритим, якщо ніхто нічого не шле.
-        peer.options.idle_timeout = Some(std::time::Duration::from_secs(30));
-        // --- SECURITY BLOCK END ---
-
-        Ok(peer)
-    }
-
-    // 4. Фільтр заголовків
-    async fn upstream_request_filter(
-        &self,
-        _session: &mut Session,
-        upstream_request: &mut RequestHeader,
-        _ctx: &mut Self::CTX,
-    ) -> Result<()> {
-        upstream_request.insert_header("Host", "one.one.one.one").unwrap();
-        Ok(())
-    }
-}
 
 // ВАЖЛИВО: Додаємо tokio::main, щоб запустити асинхронний світ
 //#[tokio::main]
 fn main() {
-    env_logger::init();
+    println!("🦖 Troodon is reading configuration...");
+    let conf = match config::load_config("config.yaml") {
+        Ok(c) => c,
+        Err(e) => {
+            // Якщо конфіг битий — ми навіть не стартуємо.
+            eprintln!("🔥 Fatal error loading config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&conf.server.log_level));
 
-    let mut my_server = Server::new(None).unwrap();
-    my_server.bootstrap();
-
-    // Створюємо список серверів (Health Check поки немає, просто список)
-    let upstreams = LoadBalancer::try_from_iter(
-        ["1.1.1.1:443", 
-        "1.0.0.1:443"
-    ]).unwrap();
-
-    // Ініціалізуємо сервіс
-    let mut lb = http_proxy_service(&my_server.configuration, LB(Arc::new(upstreams)));
+    // Ініціалізуємо "Subscriber", який буде писати в консоль (fmt)
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .init();
     
-    lb.add_tcp("0.0.0.0:6188");
+    info!("Logger initialized with level: '{}'", conf.server.log_level);
+    info!("🦖 Troodon is starting...");
+    let mut troodon_server = Server::new(None).unwrap();
+    troodon_server.bootstrap();
 
-    println!("Troodon Load Balancer is active on 0.0.0.0:6188");
+    // 4. ОТРИМАННЯ АПСТРІМІВ (BACKENDS)
+    // Шукаємо в конфізі location з шляхом "/"
+    // Це Rust-way роботи з колекціями (Iterator API)
+    let upstreams_list = conf.routes.iter()
+        .flat_map(|r| &r.locations)
+        .find(|l| l.path == "/")
+        .map(|l| &l.upstreams)
+        .expect("CRITICAL: Config must have a default '/' route!");
 
-    my_server.add_service(lb);
-    my_server.run_forever();
+    if upstreams_list.is_empty() {
+        error!("No upstreams defined in config!");
+        std::process::exit(1);
+    }
+    
+    debug!("Loaded upstreams for root: {:?}", upstreams_list);
+
+    // Створюємо Load Balancer з даних YAML
+    let upstreams = LoadBalancer::try_from_iter(upstreams_list).unwrap();
+    let server_config = Arc::new(conf.server);
+
+    // Створюємо LB вже як нормальну структуру
+    let lb_instance = LB {
+        upstreams: Arc::new(upstreams),
+        config: server_config.clone(), // Передаємо конфіг всередину
+    };
+
+    // 5. ЗАПУСК СЕРВІСУ
+    let mut lb_service = http_proxy_service(
+        &troodon_server.configuration, lb_instance);
+    
+    // Склеюємо IP та Port: "0.0.0.0" + ":" + "6188"
+    let bind_addr = format!("{}:{}", server_config.listen_addr, server_config.listen_port);
+    
+    info!("Troodon is binding to TCP: {}", bind_addr);
+    lb_service.add_tcp(&bind_addr);
+
+    troodon_server.add_service(lb_service);
+    troodon_server.run_forever();
 }

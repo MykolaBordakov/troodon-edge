@@ -1,43 +1,45 @@
-#![allow(dead_code)]
+#![allow(dead_code)] // Щоб Rust не сварився на поля, які ми поки не юзаємо (напр. tls)
+
 use serde::Deserialize;
 use std::collections::HashMap;
 
-// #[derive(Debug, Deserialize)] -> Це макроси.
-// Debug - аналог Stringer в Go (дозволяє робити println!("{:?}", conf)).
-// Deserialize - генерує код для розпарсингу YAML/JSON у цю структуру (автоматична імплементація інтерфейсу).
-
+// --- ГОЛОВНА СТРУКТУРА ---
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
-    // Option<T> - це як вказівник (*T) в Go, який може бути nil.
-    // Якщо поля немає в YAML, буде None.
     pub tls: Option<TlsConfig>, 
     pub routes: Vec<Route>,
 }
 
+// --- SERVER CONFIG ---
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
-    // В Go ти б писав `yaml:"listen_addr"`.
-    // Serde вміє це автоматично, якщо імена збігаються, але ми можемо форсувати.
     pub listen_addr: String,
+    
     #[serde(default = "default_port")]
     pub listen_port: u16,
+    
     #[serde(default = "default_log_level")]
     pub log_level: String,
-    #[serde(default)]
+    
+    #[serde(default)] // Викличе Timeouts::default()
     pub timeouts: Timeouts,
 }
 
 fn default_log_level() -> String {
+    // Використовуємо eprintln!, щоб додати новий рядок
+    eprintln!("⚠️ [WARN] 'log_level' missing in config. Defaulting to 'info'.");
     "info".to_string()
 }
+
 fn default_port() -> u16 {
+    eprintln!("⚠️ [WARN] 'listen_port' missing in config. Defaulting to 6188.");
     6188
 }
-// Часи в секундах, які ми будемо використовувати для налаштування таймаутів у проксі.
 
+// --- TIMEOUTS ---
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default)] // Дозволяє часткове заповнення (наприклад, тільки read)
 pub struct Timeouts {
     pub connect: u64,
     pub read: u64,
@@ -47,6 +49,8 @@ pub struct Timeouts {
 
 impl Default for Timeouts {
     fn default() -> Self {
+        // Форматуємо гарно, щоб не ламати консоль
+        eprintln!("⚠️ [WARN] Timeouts not fully specified. Using defaults: connect=5s, read=10s, write=10s, idle=30s.");
         Timeouts {
             connect: 5,
             read: 10,
@@ -56,9 +60,9 @@ impl Default for Timeouts {
     }
 }
 
+// --- TLS ---
 #[derive(Debug, Deserialize)]
 pub struct TlsConfig {
-    // HashMap - це map[string]CertificateConfig
     pub certificates: HashMap<String, CertificateConfig>,
 }
 
@@ -68,18 +72,31 @@ pub struct CertificateConfig {
     pub key: String,
 }
 
+// --- ROUTES ---
 #[derive(Debug, Deserialize)]
 pub struct Route {
-    pub host: Option<String>,
+    // Тут ми гарантуємо String. Якщо в YAML немає host — буде дефолт.
+    #[serde(default = "default_host")]
+    pub host: String,
     pub locations: Vec<Location>,
 }
 
+fn default_host() -> String {
+    // ВАЖЛИВО: SNI не може бути "*". 
+    // Для тесту використовуємо one.one.one.one, в реальності тут може бути пустий рядок,
+    // який ми обробимо як "не надсилати SNI".
+    eprintln!("⚠️ [WARN] Route 'host' missing. Defaulting to 'one.one.one.one' (Cloudflare).");
+    "one.one.one.one".to_string()
+}
+
+// --- LOCATIONS ---
 #[derive(Debug, Deserialize)]
 pub struct Location {
+    #[serde(default = "default_host_path")]
     pub path: String,
+    
     pub upstreams: Vec<String>,
     
-    // default - якщо поля немає, візьми false (значення за замовчуванням для bool).
     #[serde(default)] 
     pub websocket: bool,
     
@@ -89,19 +106,19 @@ pub struct Location {
     pub settings: Option<LocationSettings>,
 }
 
+fn default_host_path() -> String {
+    eprintln!("⚠️ [WARN] Location path missing. Defaulting to '/'.");
+    "/".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LocationSettings {
     pub client_max_body_size: Option<usize>,
 }
 
-// Функція-конструктор (Factory pattern).
-// Result<Config> - це як (Config, error) в Go.
+// --- LOADER ---
 pub fn load_config(path: &str) -> Result<Config, anyhow::Error> {
-    // ? в кінці - це магія Rust. 
-    // Це аналог: if err != nil { return nil, err }
-    
     let f = std::fs::File::open(path)?; 
     let config: Config = serde_yaml::from_reader(f)?;
-    
     Ok(config)
 }

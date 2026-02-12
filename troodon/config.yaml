@@ -3,19 +3,19 @@ server:
   listen_addr: "0.0.0.0"  # Тільки IP
   listen_port: 6188       # Тільки порт
   log_level: "info"      # Рівень деталізації
-  timeouts:
-    connect: 5
-    read: 10
-    write: 10
-    idle: 30
+  # timeouts:
+  #   connect: 5
+  #   read: 10
+  #   write: 10
+  #   idle: 30
 
 # Поки секція пуста, бо ми не дійшли до SSL
 tls: null
 
 routes:
-  # Основний маршрут
-  - locations:
+  - host: "one.one.one.one"
+    locations:
+      - path: "/api"
+        upstreams: ["1.1.1.1:443"] # Робочий Cloudflare
       - path: "/"
-        upstreams: 
-          - "1.1.19.1:443"
-          - "1.0.0000.1:443"
+        upstreams: ["1.0.0.1:443"] # Теж робочий

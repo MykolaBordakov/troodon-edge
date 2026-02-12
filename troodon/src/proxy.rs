@@ -3,75 +3,142 @@ use pingora::prelude::*;
 use pingora::lb::LoadBalancer;
 use pingora::lb::selection::RoundRobin;
 use std::sync::Arc;
-use tracing::{debug, info, error}; // info! для access logs
+use tracing::{debug, info, error, warn};
 use crate::config::ServerConfig;
 
-// Наша структура-балансувальник
-// Pub, щоб main міг її бачити
-//pub struct LB(pub Arc<LoadBalancer<RoundRobin>>);
+// === СТРУКТУРИ ===
 
-pub struct LB {
-    pub upstreams:  Arc<LoadBalancer<RoundRobin>>,
-    pub config: Arc<ServerConfig>, // <--- Зберігаємо конфіг тут
+// 1. Опис маршруту (те, що ми підготували в main.rs)
+pub struct ProxyRoute {
+    pub path: String,
+    pub lb: Arc<LoadBalancer<RoundRobin>>,
+    pub sni: String,
 }
 
+// 2. Контекст запиту (наш "кошик" для передачі даних між етапами)
+pub struct ProxyContext {
+    pub sni: String, // Тут ми будемо зберігати SNI, який знайшли в upstream_peer
+    pub strip_prefix: bool,
+    // Що саме обрізати? (наприклад "/api")
+    pub path_prefix: String,
+}
+
+// 3. Головна структура
+pub struct LB {
+    pub routes: Arc<Vec<ProxyRoute>>, 
+    pub config: Arc<ServerConfig>,
+}
 
 #[async_trait]
 impl ProxyHttp for LB {
-    // 1. Визначаємо тип контексту (обов'язково!)
-    type CTX = ();
+    // === ВАЖЛИВО: Визначаємо наш тип контексту ===
+    type CTX = ProxyContext;
     
-    // 2. Створюємо контекст (обов'язково!)
+    // Ініціалізуємо контекст порожнім рядком
     fn new_ctx(&self) -> Self::CTX {
-        ()
+        ProxyContext { 
+            sni: String::new(),
+            strip_prefix: false,
+            path_prefix: String::new(),
+        }
     }
 
-    // 3. Визначаємо, куди слати трафік (обов'язково!)
+    // 1. ВИБІР БЕКЕНДУ
     async fn upstream_peer(
         &self,
-        _session: &mut Session,
-        _ctx: &mut Self::CTX,
+        session: &mut Session,
+        ctx: &mut Self::CTX, // Отримуємо доступ до контексту
     ) -> Result<Box<HttpPeer>> {
-        // ВИКОРИСТОВУЄМО БАЛАНСУВАЛЬНИК
-        // self.0 — це доступ до першого елементу нашої структури (Arc<LoadBalancer>)
-        // select() обирає бекенд за алгоритмом RoundRobin
-        let upstream = self.upstreams.select(b"", 256).unwrap();
+        
+        let path = session.req_header().uri.path();
+        
+        // Шукаємо маршрут (Longest Prefix Match - поки беремо перший підходящий)
+        let matching_route = self.routes.iter()
+            .find(|route| path.starts_with(&route.path));
 
+        let route = match matching_route {
+            Some(r) => r,
+            None => {
+                warn!("No route found for path: {}", path);
+                // Повертаємо 404, якщо маршрут не знайдено
+                return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)));
+            }
+        };
+
+        debug!("Path '{}' matched route '{}'", path, route.path);
+
+        // === МАГІЯ ТУТ ===
+        // Зберігаємо знайдений SNI в контекст, щоб використати пізніше
+        ctx.sni = route.sni.clone(); 
+        ctx.strip_prefix = route.strip_prefix; // Чи різати?
+        ctx.path_prefix = route.path.clone();  // Що різати?
+
+        let upstream = route.lb.select(b"", 256).unwrap();
         debug!("Load Balancer selected upstream: {:?}", upstream.addr.as_inet());
 
-        // Створюємо Peer з обраної IP
-        let mut peer = Box::new(HttpPeer::new(upstream.addr, true, "one.one.one.one".to_string()));
-        peer.sni = "one.one.one.one".to_string();
-        // --- SECURITY BLOCK START ---
-        // 1. Connection Timeout (5 сек)
-        // Скільки чекаємо на TCP Handshake + TLS Handshake.
-        // Якщо сервер "тупить" або лежить — кидаємо помилку, не висимо.
+        let mut peer = Box::new(HttpPeer::new(
+            upstream.addr, 
+            true, 
+            route.sni.clone() 
+        ));
+        
+        peer.sni = route.sni.clone();
+        
+        // Тайм-аути
         let timeouts = &self.config.timeouts;
-
-        // 1. Connection Timeout (Connect)
         peer.options.connection_timeout = Some(std::time::Duration::from_secs(timeouts.connect));
-
-        // 2. Read Timeout (TTFB)
         peer.options.read_timeout = Some(std::time::Duration::from_secs(timeouts.read));
-
-        // 3. Write Timeout
         peer.options.write_timeout = Some(std::time::Duration::from_secs(timeouts.write));
-
-        // 4. Idle Timeout (Keep-Alive)
         peer.options.idle_timeout = Some(std::time::Duration::from_secs(timeouts.idle));
-        // --- SECURITY BLOCK END ---
 
         Ok(peer)
     }
 
-    // 4. Фільтр заголовків
+    // 2. МОДИФІКАЦІЯ ЗАГОЛОВКІВ
     async fn upstream_request_filter(
         &self,
         _session: &mut Session,
         upstream_request: &mut RequestHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX, // Читаємо контекст
     ) -> Result<()> {
-        upstream_request.insert_header("Host", "one.one.one.one").unwrap();
+        // Більше ніяких пошуків і хардкоду!
+        // Ми просто беремо те, що поклали в upstream_peer
+        if !ctx.sni.is_empty() {
+            upstream_request.insert_header("Host", &ctx.sni).unwrap();
+        } else {
+            // Це станеться тільки якщо upstream_peer повернув помилку,
+            // але тоді цей метод і не викличеться.
+            error!("Context SNI is empty, something went wrong internally");
+        }
+
         Ok(())
+    }
+
+    async fn logging(
+        &self,
+        session: &mut Session,
+        e: Option<&pingora::Error>,
+        _ctx: &mut Self::CTX,
+    ) {
+        let response_code = session
+            .response_written()
+            .map(|resp| resp.status.as_u16())
+            .unwrap_or(0);
+
+        if let Some(error) = e {
+            error!(
+                "Request failed: {} {} | Error: {}", 
+                session.req_header().method, 
+                session.req_header().uri.path(),
+                error
+            );
+        } else {
+            info!(
+                "ACCESS: {} {} -> {}",
+                session.req_header().method,
+                session.req_header().uri.path(),
+                response_code
+            );
+        }
     }
 }

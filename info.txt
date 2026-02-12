@@ -1,0 +1,7 @@
+Project Name: Troodon.
+
+Architecture: Data Plane на Rust (Pingora), Control Plane на Go.
+
+Goal: Високопродуктивний Edge Proxy з динамічною конфігурацією та eBPF-плагінами для фільтрації трафіку.
+
+Current State: Початок розробки Proxy-частини на Rust.

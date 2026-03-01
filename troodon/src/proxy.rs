@@ -1,9 +1,36 @@
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use pingora::prelude::*;
+use matchit::Router;
 use pingora::lb::LoadBalancer;
 use pingora::lb::selection::RoundRobin;
+use pingora::prelude::*;
+use pingora::upstreams::peer::Peer;
 use std::sync::Arc;
-use tracing::{debug, info, error, warn};
+use std::time::Instant;
+use tracing::{debug, error, info, warn};
+
+use lazy_static::lazy_static;
+use prometheus::{
+    HistogramVec, IntCounterVec, Opts, register_histogram_vec, register_int_counter_vec,
+};
+
+lazy_static! {
+    static ref REQ_COUNTER: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "troodon_http_requests_total",
+            "Total number of HTTP requests"
+        ),
+        &["method", "status", "host"]
+    )
+    .expect("Failed to create metric REQ_COUNTER");
+    static ref REQ_DURATION: HistogramVec = register_histogram_vec!(
+        "troodon_http_request_duration_seconds",
+        "HTTP request duration in seconds",
+        &["method", "status", "host"]
+    )
+    .expect("Failed to create metric REQ_DURATION");
+}
+
 use crate::config::ServerConfig;
 
 // === СТРУКТУРИ ===
@@ -13,33 +40,44 @@ pub struct ProxyRoute {
     pub path: String,
     pub lb: Arc<LoadBalancer<RoundRobin>>,
     pub sni: String,
+    pub strip_prefix: bool,
+    pub max_inflight: Option<isize>,
 }
 
 // 2. Контекст запиту (наш "кошик" для передачі даних між етапами)
 pub struct ProxyContext {
-    pub sni: String, // Тут ми будемо зберігати SNI, який знайшли в upstream_peer
+    pub sni: String,
     pub strip_prefix: bool,
-    // Що саме обрізати? (наприклад "/api")
     pub path_prefix: String,
+    pub inflight_guard: Option<pingora_limits::inflight::Guard>,
+    pub start_time: Instant,
 }
 
-// 3. Головна структура
+// 3. Роутер, який містить Radix-дерево
+pub struct ProxyRouter {
+    pub routes: Router<Arc<ProxyRoute>>,
+}
+
+// 4. Головна структура балансувальника
 pub struct LB {
-    pub routes: Arc<Vec<ProxyRoute>>, 
+    pub router: Arc<ArcSwap<ProxyRouter>>,
     pub config: Arc<ServerConfig>,
+    pub inflight: Arc<pingora_limits::inflight::Inflight>,
 }
 
 #[async_trait]
 impl ProxyHttp for LB {
     // === ВАЖЛИВО: Визначаємо наш тип контексту ===
     type CTX = ProxyContext;
-    
-    // Ініціалізуємо контекст порожнім рядком
+
+    // Ініціалізуємо контекст порожнім
     fn new_ctx(&self) -> Self::CTX {
-        ProxyContext { 
+        ProxyContext {
             sni: String::new(),
             strip_prefix: false,
             path_prefix: String::new(),
+            inflight_guard: None,
+            start_time: Instant::now(),
         }
     }
 
@@ -49,16 +87,24 @@ impl ProxyHttp for LB {
         session: &mut Session,
         ctx: &mut Self::CTX, // Отримуємо доступ до контексту
     ) -> Result<Box<HttpPeer>> {
-        
-        let path = session.req_header().uri.path();
-        
-        // Шукаємо маршрут (Longest Prefix Match - поки беремо перший підходящий)
-        let matching_route = self.routes.iter()
-            .find(|route| path.starts_with(&route.path));
+        // Зберігаємо час початку запиту в context (використовуємо pingora context cache замість кастомних полів, або додамо поле в ProxyContext)
+        // Для простоти, додаватимемо поле `start_time` у ProxyContext.
 
-        let route = match matching_route {
-            Some(r) => r,
-            None => {
+        let path = session.req_header().uri.path();
+
+        // Атомарно читаємо поточний роутер
+        let router_guard = self.router.load();
+
+        info!("🔍 Trying to route path: '{}'", path); // NEW DEBUG LOG
+
+        // Шукаємо маршрут через Radix-дерево (O(k), де k - довжина шляху)
+        let route = match router_guard.routes.at(path) {
+            Ok(found) => {
+                info!("✅ Mathit found match!");
+                found.value
+            }
+            Err(e) => {
+                error!("❌ Matchit rejected path '{}' with error: {:?}", path, e); // NEW DEBUG LOG
                 warn!("No route found for path: {}", path);
                 // Повертаємо 404, якщо маршрут не знайдено
                 return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)));
@@ -69,21 +115,55 @@ impl ProxyHttp for LB {
 
         // === МАГІЯ ТУТ ===
         // Зберігаємо знайдений SNI в контекст, щоб використати пізніше
-        ctx.sni = route.sni.clone(); 
+        ctx.sni = route.sni.clone();
         ctx.strip_prefix = route.strip_prefix; // Чи різати?
-        ctx.path_prefix = route.path.clone();  // Що різати?
+        ctx.path_prefix = route.path.clone(); // Що різати?
 
         let upstream = route.lb.select(b"", 256).unwrap();
-        debug!("Load Balancer selected upstream: {:?}", upstream.addr.as_inet());
+        debug!(
+            "Load Balancer selected upstream: {:?}",
+            upstream.addr.as_inet()
+        );
 
-        let mut peer = Box::new(HttpPeer::new(
-            upstream.addr, 
-            true, 
-            route.sni.clone() 
-        ));
-        
-        peer.sni = route.sni.clone();
-        
+        // Визначаємо, чи потрібен TLS (залежить від порту або конфігурації)
+        // Поки що просто перевіряємо чи бекенд має порт 443
+        let use_tls = match upstream.addr.as_inet() {
+            Some(inet) => inet.port() == 443,
+            None => false,
+        };
+
+        // --- CIRCUIT BREAKER (pingora-limits) ---
+        // Відстеження Inflight запитів для запобігання перевантаження "завислого" бекенду.
+        if let Some(max_conn) = route.max_inflight {
+            // Отримуємо унікальний ключ для бекенду (наприклад, його IP:Port строку)
+            let backend_key = upstream.addr.to_string();
+            // Збільшуємо лічильник для цього бекенду
+            let (guard, current_inflight) = self.inflight.incr(backend_key.clone(), 1);
+
+            if current_inflight > max_conn {
+                warn!(
+                    "🛑 Backend {} overloaded. Current inflight ({} > {}). Rejecting request with 503.",
+                    backend_key, current_inflight, max_conn
+                );
+                return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(503)));
+            }
+
+            // Якщо все добре, зберігаємо guard в контекст.
+            // Щойно клієнт відключиться або запит завершиться, `ctx` знищиться і guard викличе decr() автоматично.
+            ctx.inflight_guard = Some(guard);
+        }
+        // ----------------------------------------
+
+        // SNI передаємо тільки якщо використовується TLS
+        let peer_sni = if use_tls {
+            route.sni.clone()
+        } else {
+            String::new()
+        };
+
+        let mut peer = Box::new(HttpPeer::new(upstream.addr, use_tls, peer_sni.clone()));
+        peer.sni = peer_sni; // Дублюємо SNI для сумісності з Pingora internal
+
         // Тайм-аути
         let timeouts = &self.config.timeouts;
         peer.options.connection_timeout = Some(std::time::Duration::from_secs(timeouts.connect));
@@ -94,23 +174,97 @@ impl ProxyHttp for LB {
         Ok(peer)
     }
 
-    // 2. МОДИФІКАЦІЯ ЗАГОЛОВКІВ
+    // 2. МОДИФІКАЦІЯ ЗАГОЛОВКІВ (Header Injection)
     async fn upstream_request_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX, // Читаємо контекст
     ) -> Result<()> {
-        // Більше ніяких пошуків і хардкоду!
-        // Ми просто беремо те, що поклали в upstream_peer
         if !ctx.sni.is_empty() {
             upstream_request.insert_header("Host", &ctx.sni).unwrap();
         } else {
-            // Це станеться тільки якщо upstream_peer повернув помилку,
-            // але тоді цей метод і не викличеться.
             error!("Context SNI is empty, something went wrong internally");
         }
 
+        // --- ДОДАЄМО ВИЗНАЧЕННЯ КЛІЄНТА (Production Header Injection) ---
+        // X-Real-IP (IP адреса TCP клієнта)
+        if let Some(client_ip) = session.client_addr() {
+            if let Some(ip) = client_ip.as_inet() {
+                let ip_str = ip.ip().to_string();
+                upstream_request
+                    .insert_header("X-Real-IP", &ip_str)
+                    .unwrap();
+                upstream_request
+                    .insert_header("X-Forwarded-For", &ip_str)
+                    .unwrap();
+            }
+        }
+
+        // Можна додати X-Request-Id (для трейсингу)
+        upstream_request
+            .insert_header("X-Proxy", "Troodon/0.1.0")
+            .unwrap();
+        // ----------------------------------------------------------------
+
+        // Логіка strip_prefix: якщо увімкнена, обрізаємо шлях
+        if ctx.strip_prefix && !ctx.path_prefix.is_empty() && ctx.path_prefix != "/" {
+            let original_path = session.req_header().uri.path();
+            if let Some(stripped) = original_path.strip_prefix(&ctx.path_prefix) {
+                // Запобігаємо порожньому шляху
+                let new_path = if stripped.is_empty() { "/" } else { stripped };
+
+                // Перевіряємо, чи є query string (наприклад, ?key=value)
+                let new_uri_string = match session.req_header().uri.query() {
+                    Some(query) => format!("{}?{}", new_path, query),
+                    None => new_path.to_string(),
+                };
+
+                // Оновлюємо URI в RequestHeader.
+                if let Ok(new_uri) = new_uri_string.parse::<http::Uri>() {
+                    upstream_request.set_uri(new_uri);
+                    debug!(
+                        "Stripped prefix '{}'. New path: {}",
+                        ctx.path_prefix, new_uri_string
+                    );
+                } else {
+                    error!("Invalid URI after strip_prefix: {}", new_uri_string);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // 3. RETRY ЛОГІКА (Passive Health Checks / Failover)
+    // Викликається Pingora, коли не вдалося з'єднатися з upstream_peer.
+    // Оскільки ми вже передали `e.set_retry(true)`, Pingora автоматично
+    // повторить вибір бекенду (викличе upstream_peer наново), якщо це безпечно.
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        peer: &HttpPeer,
+        _ctx: &mut Self::CTX,
+        mut e: Box<pingora::Error>,
+    ) -> Box<pingora::Error> {
+        e.set_retry(true);
+        warn!(
+            "Failed to connect to upstream {:?}, error: {}. Retrying...",
+            peer.address(),
+            e
+        );
+        e
+    }
+
+    // 4. МОДИФІКАЦІЯ ВІДПОВІДІ (Response Header Injection)
+    async fn upstream_response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        // Додаємо заголовок, щоб показати, що відповідь пройшла через наш проксі
+        upstream_response.insert_header("X-Proxy-By", "Troodon/0.1.0")?;
         Ok(())
     }
 
@@ -118,26 +272,47 @@ impl ProxyHttp for LB {
         &self,
         session: &mut Session,
         e: Option<&pingora::Error>,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) {
         let response_code = session
             .response_written()
             .map(|resp| resp.status.as_u16())
             .unwrap_or(0);
 
+        let status_str = response_code.to_string();
+        let method_str = session.req_header().method.as_str();
+
+        // Host header can be empty, fallback to unknown
+        let host_str = if ctx.sni.is_empty() {
+            "unknown"
+        } else {
+            &ctx.sni
+        };
+
+        // Записуємо статистику у Prometheus
+        REQ_COUNTER
+            .with_label_values(&[method_str, &status_str, host_str])
+            .inc();
+        let duration = ctx.start_time.elapsed().as_secs_f64();
+        REQ_DURATION
+            .with_label_values(&[method_str, &status_str, host_str])
+            .observe(duration);
+
         if let Some(error) = e {
             error!(
-                "Request failed: {} {} | Error: {}", 
-                session.req_header().method, 
+                "Request failed: {} {} | Error: {} | Latency: {:.4}s",
+                session.req_header().method,
                 session.req_header().uri.path(),
-                error
+                error,
+                duration
             );
         } else {
             info!(
-                "ACCESS: {} {} -> {}",
+                "ACCESS: {} {} -> {} | Latency: {:.4}s",
                 session.req_header().method,
                 session.req_header().uri.path(),
-                response_code
+                response_code,
+                duration
             );
         }
     }

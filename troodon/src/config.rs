@@ -7,7 +7,7 @@ use std::collections::HashMap;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
-    pub tls: Option<TlsConfig>, 
+    pub tls: Option<TlsConfig>,
     pub routes: Vec<Route>,
 }
 
@@ -15,15 +15,21 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     pub listen_addr: String,
-    
+
     #[serde(default = "default_port")]
     pub listen_port: u16,
-    
+
     #[serde(default = "default_log_level")]
     pub log_level: String,
-    
+
     #[serde(default)] // Викличе Timeouts::default()
     pub timeouts: Timeouts,
+
+    // Порт для експорту метрик Prometheus (опціонально)
+    pub prometheus_port: Option<u16>,
+
+    // Порт для HTTPS/TLS трафіку (опціонально)
+    pub tls_port: Option<u16>,
 }
 
 fn default_log_level() -> String {
@@ -50,7 +56,9 @@ pub struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         // Форматуємо гарно, щоб не ламати консоль
-        eprintln!("⚠️ [WARN] Timeouts not fully specified. Using defaults: connect=5s, read=10s, write=10s, idle=30s.");
+        eprintln!(
+            "⚠️ [WARN] Timeouts not fully specified. Using defaults: connect=5s, read=10s, write=10s, idle=30s."
+        );
         Timeouts {
             connect: 5,
             read: 10,
@@ -82,7 +90,7 @@ pub struct Route {
 }
 
 fn default_host() -> String {
-    // ВАЖЛИВО: SNI не може бути "*". 
+    // ВАЖЛИВО: SNI не може бути "*".
     // Для тесту використовуємо one.one.one.one, в реальності тут може бути пустий рядок,
     // який ми обробимо як "не надсилати SNI".
     eprintln!("⚠️ [WARN] Route 'host' missing. Defaulting to 'one.one.one.one' (Cloudflare).");
@@ -94,15 +102,28 @@ fn default_host() -> String {
 pub struct Location {
     #[serde(default = "default_host_path")]
     pub path: String,
-    
+
     pub upstreams: Vec<String>,
-    
-    #[serde(default)] 
+
+    #[serde(default)]
     pub websocket: bool,
-    
+
     #[serde(default)]
     pub strip_prefix: bool,
-    
+
+    // Контролює, чи це точний збіг (наприклад "/api"), чи ми додаємо wildcard ("/*rest")
+    #[serde(default)]
+    pub exact_match: bool,
+
+    // Шлях для Active Health Check (якщо None, тоді Active Health Check вимкнено)
+    pub health_check_path: Option<String>,
+
+    // Кількість спроб повтору запиту (Retries), якщо бекенд лежить
+    pub retry_count: Option<usize>,
+
+    // Максимальна кількість одночасних запитів (inflight) до одного бекенду (pingora-limits)
+    pub max_inflight: Option<isize>,
+
     pub settings: Option<LocationSettings>,
 }
 
@@ -118,7 +139,7 @@ pub struct LocationSettings {
 
 // --- LOADER ---
 pub fn load_config(path: &str) -> Result<Config, anyhow::Error> {
-    let f = std::fs::File::open(path)?; 
+    let f = std::fs::File::open(path)?;
     let config: Config = serde_yaml::from_reader(f)?;
     Ok(config)
 }

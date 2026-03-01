@@ -1,21 +1,35 @@
 # Конфігураційний файл для Troodon Load Balancer Приклад
 server:
-  listen_addr: "0.0.0.0"  # Тільки IP
-  listen_port: 6188       # Тільки порт
-  log_level: "info"      # Рівень деталізації
+  listen_addr: "0.0.0.0" # Тільки IP
+  listen_port: 6188 # Тільки порт HTTP
+  tls_port: 6443 # Порт HTTPS
+  prometheus_port: 9090 # Порт для Prometheus метрик
+  log_level: "debug" # Рівень деталізації
   # timeouts:
   #   connect: 5
   #   read: 10
   #   write: 10
   #   idle: 30
 
-# Поки секція пуста, бо ми не дійшли до SSL
-tls: null
+tls:
+  certificates:
+    test_cert:
+      cert: "test.crt"
+      key: "test.key"
 
 routes:
   - host: "one.one.one.one"
     locations:
+      - path: "/dummy"
+        exact_match: true
+        upstreams: ["127.0.0.1:8000"]
+        health_check_path: "/"
+        retry_count: 3
       - path: "/api"
         upstreams: ["1.1.1.1:443"] # Робочий Cloudflare
+        health_check_path: "/"
+        retry_count: 2
       - path: "/"
-        upstreams: ["1.0.0.1:443"] # Теж робочий
+        upstreams: ["127.0.0.1:8000"] # Наш локальний сервер
+        health_check_path: "/"
+        retry_count: 3

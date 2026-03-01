@@ -18,7 +18,7 @@ async-trait = "0.1"
 # tracing - це ядро (фасад)
 tracing = "0.1"
 # tracing-subscriber - це реалізація (пише в stdout, JSON, etc.)
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # log - потрібен для сумісності, бо Pingora пише в старий 'log' crate
 log = "0.4"
 
@@ -30,3 +30,10 @@ serde_yaml = "0.9"
 # === Error Handling ===
 # Щоб простіше повертати помилки (Result<T, anyhow::Error>)
 anyhow = "1.0"
+arc-swap = "1.8.2"
+matchit = "0.9.1"
+http = "1.4.0"
+signal-hook = "0.4.3"
+pingora-limits = "0.7.0"
+prometheus = "0.13"
+lazy_static = "1.5.0"

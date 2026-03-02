@@ -42,6 +42,7 @@ pub struct ProxyRoute {
     pub sni: String,
     pub strip_prefix: bool,
     pub max_inflight: Option<isize>,
+    pub timeouts: crate::config::Timeouts,
 }
 
 // 2. Контекст запиту (наш "кошик" для передачі даних між етапами)
@@ -56,6 +57,7 @@ pub struct ProxyContext {
 // 3. Роутер, який містить Radix-дерево
 pub struct ProxyRouter {
     pub routes: Router<Arc<ProxyRoute>>,
+    pub health_checks: Vec<(String, Arc<LoadBalancer<RoundRobin>>)>,
 }
 
 // 4. Головна структура балансувальника
@@ -79,6 +81,43 @@ impl ProxyHttp for LB {
             inflight_guard: None,
             start_time: Instant::now(),
         }
+    }
+
+    // 0. ФІЛЬТР ЗАПИТУ (Рання валідація L7 Security)
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        // 1. Захист від Slowloris: Встановлюємо тайм-аут на читання заголовків (Client Read Timeout)
+        if let Some(timeout) = self.config.client_read_timeout {
+            session.set_read_timeout(Some(std::time::Duration::from_secs(timeout)));
+            debug!("Set client read timeout to {}s", timeout);
+        }
+
+        // 2. Захист від OOM: Перевірка максимального розміру заголовків
+        if let Some(max_size) = self.config.max_header_size {
+            // Рахуємо приблизний розмір заголовків:
+            let mut current_size = 0;
+            current_size += session.req_header().method.as_str().len();
+            current_size += session
+                .req_header()
+                .uri
+                .path_and_query()
+                .map_or(0, |pq| pq.as_str().len());
+
+            for (k, v) in session.req_header().headers.iter() {
+                current_size += k.as_str().len() + v.len() + 2; // + ': '
+            }
+
+            if current_size > max_size {
+                warn!(
+                    "🛑 Rejecting request: Headers too large ({} bytes > {} bytes max)",
+                    current_size, max_size
+                );
+                // 431 Request Header Fields Too Large
+                let _ = session.respond_error(431).await;
+                return Ok(true); // Перериваємо подальшу обробку (Early return)
+            }
+        }
+
+        Ok(false) // Пропускаємо запит далі
     }
 
     // 1. ВИБІР БЕКЕНДУ
@@ -164,8 +203,8 @@ impl ProxyHttp for LB {
         let mut peer = Box::new(HttpPeer::new(upstream.addr, use_tls, peer_sni.clone()));
         peer.sni = peer_sni; // Дублюємо SNI для сумісності з Pingora internal
 
-        // Тайм-аути
-        let timeouts = &self.config.timeouts;
+        // Тайм-аути із маршруту (Route Specific)
+        let timeouts = &route.timeouts;
         peer.options.connection_timeout = Some(std::time::Duration::from_secs(timeouts.connect));
         peer.options.read_timeout = Some(std::time::Duration::from_secs(timeouts.read));
         peer.options.write_timeout = Some(std::time::Duration::from_secs(timeouts.write));
@@ -182,7 +221,7 @@ impl ProxyHttp for LB {
         ctx: &mut Self::CTX, // Читаємо контекст
     ) -> Result<()> {
         if !ctx.sni.is_empty() {
-            upstream_request.insert_header("Host", &ctx.sni).unwrap();
+            upstream_request.insert_header("Host", &ctx.sni)?;
         } else {
             error!("Context SNI is empty, something went wrong internally");
         }
@@ -192,19 +231,13 @@ impl ProxyHttp for LB {
         if let Some(client_ip) = session.client_addr() {
             if let Some(ip) = client_ip.as_inet() {
                 let ip_str = ip.ip().to_string();
-                upstream_request
-                    .insert_header("X-Real-IP", &ip_str)
-                    .unwrap();
-                upstream_request
-                    .insert_header("X-Forwarded-For", &ip_str)
-                    .unwrap();
+                upstream_request.insert_header("X-Real-IP", &ip_str)?;
+                upstream_request.insert_header("X-Forwarded-For", &ip_str)?;
             }
         }
 
         // Можна додати X-Request-Id (для трейсингу)
-        upstream_request
-            .insert_header("X-Proxy", "Troodon/0.1.0")
-            .unwrap();
+        upstream_request.insert_header("X-Proxy", "Troodon/0.1.0")?;
         // ----------------------------------------------------------------
 
         // Логіка strip_prefix: якщо увімкнена, обрізаємо шлях
@@ -214,21 +247,33 @@ impl ProxyHttp for LB {
                 // Запобігаємо порожньому шляху
                 let new_path = if stripped.is_empty() { "/" } else { stripped };
 
-                // Перевіряємо, чи є query string (наприклад, ?key=value)
-                let new_uri_string = match session.req_header().uri.query() {
-                    Some(query) => format!("{}?{}", new_path, query),
+                // Розбираємо існуючий Uri на частини (Parts) як рекомендовано Best Practices
+                let mut parts = session.req_header().uri.clone().into_parts();
+
+                let new_pq_string = match parts.path_and_query.as_ref().and_then(|pq| pq.query()) {
+                    Some(query) => {
+                        let mut pq = String::with_capacity(new_path.len() + 1 + query.len());
+                        pq.push_str(new_path);
+                        pq.push('?');
+                        pq.push_str(query);
+                        pq
+                    }
                     None => new_path.to_string(),
                 };
 
-                // Оновлюємо URI в RequestHeader.
-                if let Ok(new_uri) = new_uri_string.parse::<http::Uri>() {
-                    upstream_request.set_uri(new_uri);
-                    debug!(
-                        "Stripped prefix '{}'. New path: {}",
-                        ctx.path_prefix, new_uri_string
-                    );
-                } else {
-                    error!("Invalid URI after strip_prefix: {}", new_uri_string);
+                if let Ok(new_pq) =
+                    http::uri::PathAndQuery::from_maybe_shared(new_pq_string.clone())
+                {
+                    parts.path_and_query = Some(new_pq);
+                    if let Ok(new_uri) = http::Uri::from_parts(parts) {
+                        upstream_request.set_uri(new_uri);
+                        debug!(
+                            "Stripped prefix '{}'. New path: {}",
+                            ctx.path_prefix, new_pq_string
+                        );
+                    } else {
+                        error!("Invalid URI after strip_prefix: {}", new_pq_string);
+                    }
                 }
             }
         }

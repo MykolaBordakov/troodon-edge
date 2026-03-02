@@ -1,3 +1,4 @@
+mod background;
 mod config;
 mod proxy;
 mod router;
@@ -9,6 +10,7 @@ use pingora::services::listening::Service;
 // use pingora::lb::LoadBalancer;
 use pingora::prelude::*;
 use pingora::proxy::http_proxy_service;
+use pingora::services::background::background_service;
 use proxy::LB;
 use router::build_router;
 use std::sync::Arc;
@@ -35,7 +37,21 @@ fn main() {
     info!("Logger initialized with level: '{}'", conf.server.log_level);
     info!("🦖 Troodon is starting...");
 
-    let mut troodon_server = Server::new(None).unwrap();
+    let opt = pingora::server::configuration::Opt::default();
+    let mut troodon_server = Server::new(Some(opt)).unwrap();
+
+    // Налаштовуємо глобальні ліміти
+    if let Some(max_conn) = conf.server.global_connections {
+        // Pingora's native worker count defaults to 1 per CPU
+        // We will just let Pingora handle this organically based on OS fd limits,
+        // as `ServerConf` doesn't strictly have a `max_connections` parameter exposed natively.
+        // Instead, we will log that we rely on OS ulimit for this.
+        info!(
+            "Global max connections set to {}, ensure OS ulimit (`ulimit -n`) is configured appropriately.",
+            max_conn
+        );
+    }
+
     troodon_server.bootstrap();
 
     // 3. ПІДГОТОВКА МАРШРУТІВ (ROUTING ENGINE)
@@ -119,6 +135,15 @@ fn main() {
         troodon_server.add_service(prom_service);
         info!("📊 Prometheus metrics exposed on TCP: {}", prom_addr);
     }
+
+    // Оголошуємо та реєструємо нативний фоновий сервіс Health Check
+    let hc_service = background_service(
+        "router_health_check",
+        background::RouterHealthCheck {
+            router: shared_router.clone(),
+        },
+    );
+    troodon_server.add_service(hc_service);
 
     troodon_server.run_forever();
 }

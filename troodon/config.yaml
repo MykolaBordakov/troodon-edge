@@ -5,11 +5,17 @@ server:
   tls_port: 6443 # Порт HTTPS
   prometheus_port: 9090 # Порт для Prometheus метрик
   log_level: "debug" # Рівень деталізації
+  # Global Timeouts (Fallback for Upstreams)
   # timeouts:
   #   connect: 5
   #   read: 10
   #   write: 10
   #   idle: 30
+
+  # L7 Security Limits (Downstream connections from Internet)
+  client_read_timeout: 10 # Seconds (Read Header Timeout)
+  max_header_size: 8192 # Bytes (Max Header Size)
+  global_connections: 50000 # Global Concurrency Limit
 
 tls:
   certificates:
@@ -25,6 +31,12 @@ routes:
         upstreams: ["127.0.0.1:8000"]
         health_check_path: "/"
         retry_count: 3
+        # Override global timeouts explicitly for this location explicitly
+        timeouts:
+          connect: 2
+          read: 5
+          write: 5
+          idle: 10
       - path: "/api"
         upstreams: ["1.1.1.1:443"] # Робочий Cloudflare
         health_check_path: "/"

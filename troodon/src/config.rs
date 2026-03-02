@@ -25,6 +25,11 @@ pub struct ServerConfig {
     #[serde(default)] // Викличе Timeouts::default()
     pub timeouts: Timeouts,
 
+    // L7 Security (Slowloris & OOM Protection)
+    pub client_read_timeout: Option<u64>,
+    pub max_header_size: Option<usize>,
+    pub global_connections: Option<usize>,
+
     // Порт для експорту метрик Prometheus (опціонально)
     pub prometheus_port: Option<u16>,
 
@@ -44,7 +49,7 @@ fn default_port() -> u16 {
 }
 
 // --- TIMEOUTS ---
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)] // Дозволяє часткове заповнення (наприклад, тільки read)
 pub struct Timeouts {
     pub connect: u64,
@@ -123,6 +128,9 @@ pub struct Location {
 
     // Максимальна кількість одночасних запитів (inflight) до одного бекенду (pingora-limits)
     pub max_inflight: Option<isize>,
+
+    // Optional location-level timeouts (overrides global)
+    pub timeouts: Option<Timeouts>,
 
     pub settings: Option<LocationSettings>,
 }

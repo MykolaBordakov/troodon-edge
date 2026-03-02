@@ -3,10 +3,11 @@ use crate::proxy::{ProxyRoute, ProxyRouter};
 use matchit::Router;
 use pingora::lb::LoadBalancer;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
     let mut router = Router::new();
+    let mut health_checks = Vec::new();
     let mut route_count = 0;
 
     for route_conf in &conf.routes {
@@ -43,24 +44,16 @@ pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
             // Завертаємо у Arc після конфігурації
             let lb_arc = Arc::new(lb);
 
-            // Якщо увімкнено Health Checks, запускаємо фоновий процес перевірки
+            // Якщо увімкнено Health Checks, зберігаємо його для BackgroundService
             if loc.health_check_path.is_some() {
-                let lb_clone = lb_arc.clone();
-                let loc_path = loc.path.clone();
-                // Pingora's main Tokio runtime might not be active yet during build_router
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let mut interval =
-                            tokio::time::interval(tokio::time::Duration::from_secs(5));
-                        loop {
-                            interval.tick().await;
-                            debug!("Running Health Check for {}", loc_path);
-                            lb_clone.backends().run_health_check(true).await;
-                        }
-                    });
-                });
+                health_checks.push((loc.path.clone(), lb_arc.clone()));
             }
+
+            // Визначаємо Timeouts для локації: беремо з локації або фолбеком глобальні
+            let loc_timeouts = loc
+                .timeouts
+                .clone()
+                .unwrap_or_else(|| conf.server.timeouts.clone());
 
             let proxy_route = Arc::new(ProxyRoute {
                 path: loc.path.clone(),
@@ -68,6 +61,7 @@ pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
                 sni: sni_host.clone(),
                 strip_prefix: loc.strip_prefix,
                 max_inflight: loc.max_inflight,
+                timeouts: loc_timeouts,
             });
 
             let path = loc.path.clone();
@@ -117,5 +111,8 @@ pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
         return None;
     }
 
-    Some(ProxyRouter { routes: router })
+    Some(ProxyRouter {
+        routes: router,
+        health_checks,
+    })
 }

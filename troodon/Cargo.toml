@@ -10,7 +10,8 @@ tokio = { version = "1", features = ["full"] }
 # Наш Proxy Framework.
 # Features:
 # - "lb": Load Balancer (базові можливості проксі)
-# - "ssl": підтримка TLS/SSL (OpenSSL)
+# - "proxy": HTTP Proxy
+# - "openssl": підтримка TLS/SSL
 pingora = { version = "0.7.0", features = ["lb", "proxy", "openssl"] }
 # Для логування (щоб бачити, що відбувається в консолі)
 async-trait = "0.1"
@@ -33,7 +34,5 @@ anyhow = "1.0"
 arc-swap = "1.8.2"
 matchit = "0.9.1"
 http = "1.4.0"
-signal-hook = "0.4.3"
 pingora-limits = "0.7.0"
 prometheus = "0.13"
-lazy_static = "1.5.0"

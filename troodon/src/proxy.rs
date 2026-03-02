@@ -5,33 +5,39 @@ use pingora::lb::LoadBalancer;
 use pingora::lb::selection::RoundRobin;
 use pingora::prelude::*;
 use pingora::upstreams::peer::Peer;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
-use lazy_static::lazy_static;
 use prometheus::{
     HistogramVec, IntCounterVec, Opts, register_histogram_vec, register_int_counter_vec,
 };
 
-lazy_static! {
-    static ref REQ_COUNTER: IntCounterVec = register_int_counter_vec!(
+static REQ_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         Opts::new(
             "troodon_http_requests_total",
             "Total number of HTTP requests"
         ),
         &["method", "status", "host"]
     )
-    .expect("Failed to create metric REQ_COUNTER");
-    static ref REQ_DURATION: HistogramVec = register_histogram_vec!(
+    .expect("Failed to create metric REQ_COUNTER")
+});
+
+static REQ_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
         "troodon_http_request_duration_seconds",
         "HTTP request duration in seconds",
         &["method", "status", "host"]
     )
-    .expect("Failed to create metric REQ_DURATION");
-}
+    .expect("Failed to create metric REQ_DURATION")
+});
 
 use crate::config::ServerConfig;
+
+// Лічильник для генерації унікальних Request ID (без зовнішніх залежностей)
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // === СТРУКТУРИ ===
 
@@ -43,6 +49,10 @@ pub struct ProxyRoute {
     pub strip_prefix: bool,
     pub max_inflight: Option<isize>,
     pub timeouts: crate::config::Timeouts,
+    pub retry_count: usize,
+    pub upstream_tls: Option<bool>,
+    pub websocket: bool,
+    pub client_max_body_size: Option<usize>,
 }
 
 // 2. Контекст запиту (наш "кошик" для передачі даних між етапами)
@@ -52,6 +62,13 @@ pub struct ProxyContext {
     pub path_prefix: String,
     pub inflight_guard: Option<pingora_limits::inflight::Guard>,
     pub start_time: Instant,
+    pub retries_left: usize,
+    // #15: Унікальний ID запиту для distributed tracing
+    pub request_id: String,
+    // #10: Guard глобального ліміту конекцій
+    pub global_guard: Option<pingora_limits::inflight::Guard>,
+    // #11: Прапорець WebSocket для спеціальної обробки заголовків
+    pub websocket: bool,
 }
 
 // 3. Роутер, який містить Radix-дерево
@@ -80,11 +97,34 @@ impl ProxyHttp for LB {
             path_prefix: String::new(),
             inflight_guard: None,
             start_time: Instant::now(),
+            retries_left: 0,
+            request_id: String::new(),
+            global_guard: None,
+            websocket: false,
         }
     }
 
     // 0. ФІЛЬТР ЗАПИТУ (Рання валідація L7 Security)
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        // #15: Генеруємо унікальний Request ID для кожного запиту
+        let req_num = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        ctx.request_id = format!("{:016x}", req_num);
+
+        // #10: Enforce глобальний ліміт конекцій
+        if let Some(max_conn) = self.config.global_connections {
+            let (guard, current) = self.inflight.incr("::global".to_string(), 1);
+            if current > max_conn as isize {
+                drop(guard); // ҉о не зберігаємо guard, лічильник відразу decr
+                warn!(
+                    "🛑 Global connection limit exceeded ({}/{} active). Returning 429. ReqID={}",
+                    current, max_conn, ctx.request_id
+                );
+                let _ = session.respond_error(429).await;
+                return Ok(true);
+            }
+            ctx.global_guard = Some(guard); // Живе до кінця запиту, авто-decr через Drop
+        }
+
         // 1. Захист від Slowloris: Встановлюємо тайм-аут на читання заголовків (Client Read Timeout)
         if let Some(timeout) = self.config.client_read_timeout {
             session.set_read_timeout(Some(std::time::Duration::from_secs(timeout)));
@@ -93,7 +133,6 @@ impl ProxyHttp for LB {
 
         // 2. Захист від OOM: Перевірка максимального розміру заголовків
         if let Some(max_size) = self.config.max_header_size {
-            // Рахуємо приблизний розмір заголовків:
             let mut current_size = 0;
             current_size += session.req_header().method.as_str().len();
             current_size += session
@@ -108,16 +147,15 @@ impl ProxyHttp for LB {
 
             if current_size > max_size {
                 warn!(
-                    "🛑 Rejecting request: Headers too large ({} bytes > {} bytes max)",
-                    current_size, max_size
+                    "🛑 Rejecting request: Headers too large ({} bytes > {} bytes max) ReqID={}",
+                    current_size, max_size, ctx.request_id
                 );
-                // 431 Request Header Fields Too Large
                 let _ = session.respond_error(431).await;
-                return Ok(true); // Перериваємо подальшу обробку (Early return)
+                return Ok(true);
             }
         }
 
-        Ok(false) // Пропускаємо запит далі
+        Ok(false)
     }
 
     // 1. ВИБІР БЕКЕНДУ
@@ -134,12 +172,12 @@ impl ProxyHttp for LB {
         // Атомарно читаємо поточний роутер
         let router_guard = self.router.load();
 
-        info!("🔍 Trying to route path: '{}'", path); // NEW DEBUG LOG
+        debug!("🔍 Routing path: '{}'", path);
 
         // Шукаємо маршрут через Radix-дерево (O(k), де k - довжина шляху)
         let route = match router_guard.routes.at(path) {
             Ok(found) => {
-                info!("✅ Mathit found match!");
+                debug!("✅ Matchit found match for path: '{}'", path);
                 found.value
             }
             Err(e) => {
@@ -158,17 +196,53 @@ impl ProxyHttp for LB {
         ctx.strip_prefix = route.strip_prefix; // Чи різати?
         ctx.path_prefix = route.path.clone(); // Що різати?
 
-        let upstream = route.lb.select(b"", 256).unwrap();
+        let upstream = match route.lb.select(b"", 256) {
+            Some(u) => u,
+            None => {
+                error!(
+                    "❌ No healthy backends available for route '{}'. Returning 502.",
+                    route.path
+                );
+                return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(502)));
+            }
+        };
         debug!(
             "Load Balancer selected upstream: {:?}",
             upstream.addr.as_inet()
         );
 
-        // Визначаємо, чи потрібен TLS (залежить від порту або конфігурації)
-        // Поки що просто перевіряємо чи бекенд має порт 443
-        let use_tls = match upstream.addr.as_inet() {
-            Some(inet) => inet.port() == 443,
-            None => false,
+        // #11: Зберігаємо WebSocket прапорець в контекст
+        ctx.websocket = route.websocket;
+
+        // Зберігаємо лічильник ретраїв з конфігу маршруту
+        ctx.retries_left = route.retry_count;
+
+        // #12: Перевірка розміру тіла запиту через Content-Length
+        if let Some(max_body) = route.client_max_body_size {
+            let content_length = session
+                .req_header()
+                .headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+
+            if content_length > max_body {
+                warn!(
+                    "🛑 Request body too large ({} > {} bytes). Returning 413. ReqID={}",
+                    content_length, max_body, ctx.request_id
+                );
+                return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(413)));
+            }
+        }
+
+        // Визначаємо, чи потрібен TLS: експліцитний upstream_tls або fallback на порт 443
+        let use_tls = match route.upstream_tls {
+            Some(explicit) => explicit,
+            None => match upstream.addr.as_inet() {
+                Some(inet) => inet.port() == 443,
+                None => false,
+            },
         };
 
         // --- CIRCUIT BREAKER (pingora-limits) ---
@@ -220,14 +294,14 @@ impl ProxyHttp for LB {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX, // Читаємо контекст
     ) -> Result<()> {
+        // --- PRODUCTION HEADERS ---
         if !ctx.sni.is_empty() {
             upstream_request.insert_header("Host", &ctx.sni)?;
         } else {
             error!("Context SNI is empty, something went wrong internally");
         }
 
-        // --- ДОДАЄМО ВИЗНАЧЕННЯ КЛІЄНТА (Production Header Injection) ---
-        // X-Real-IP (IP адреса TCP клієнта)
+        // X-Real-IP / X-Forwarded-For
         if let Some(client_ip) = session.client_addr() {
             if let Some(ip) = client_ip.as_inet() {
                 let ip_str = ip.ip().to_string();
@@ -236,9 +310,21 @@ impl ProxyHttp for LB {
             }
         }
 
-        // Можна додати X-Request-Id (для трейсингу)
+        // #15: X-Request-Id для distributed tracing
+        upstream_request.insert_header("X-Request-Id", &ctx.request_id)?;
         upstream_request.insert_header("X-Proxy", "Troodon/0.1.0")?;
-        // ----------------------------------------------------------------
+
+        // #11: Для WebSocket передаємо hop-by-hop заголовки Upgrade/Connection
+        if ctx.websocket {
+            if let Some(upg_val) = session.req_header().headers.get("upgrade").cloned() {
+                upstream_request.insert_header("Upgrade", upg_val)?;
+            }
+            upstream_request.insert_header("Connection", "Upgrade")?;
+            debug!(
+                "WebSocket upgrade headers forwarded. ReqID={}",
+                ctx.request_id
+            );
+        }
 
         // Логіка strip_prefix: якщо увімкнена, обрізаємо шлях
         if ctx.strip_prefix && !ctx.path_prefix.is_empty() && ctx.path_prefix != "/" {
@@ -289,15 +375,23 @@ impl ProxyHttp for LB {
         &self,
         _session: &mut Session,
         peer: &HttpPeer,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
         mut e: Box<pingora::Error>,
     ) -> Box<pingora::Error> {
-        e.set_retry(true);
-        warn!(
-            "Failed to connect to upstream {:?}, error: {}. Retrying...",
-            peer.address(),
-            e
-        );
+        if ctx.retries_left > 0 {
+            ctx.retries_left -= 1;
+            e.set_retry(true);
+            warn!(
+                "Failed to connect to upstream {:?} (retries left: {}). Retrying...",
+                peer.address(),
+                ctx.retries_left
+            );
+        } else {
+            warn!(
+                "Failed to connect to upstream {:?}. No retries left, giving up.",
+                peer.address()
+            );
+        }
         e
     }
 
@@ -345,19 +439,21 @@ impl ProxyHttp for LB {
 
         if let Some(error) = e {
             error!(
-                "Request failed: {} {} | Error: {} | Latency: {:.4}s",
+                "Request failed: {} {} | Error: {} | Latency: {:.4}s | ReqID={}",
                 session.req_header().method,
                 session.req_header().uri.path(),
                 error,
-                duration
+                duration,
+                ctx.request_id
             );
         } else {
             info!(
-                "ACCESS: {} {} -> {} | Latency: {:.4}s",
+                "ACCESS: {} {} -> {} | Latency: {:.4}s | ReqID={}",
                 session.req_header().method,
                 session.req_header().uri.path(),
                 response_code,
-                duration
+                duration,
+                ctx.request_id
             );
         }
     }

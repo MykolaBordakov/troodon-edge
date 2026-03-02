@@ -4,7 +4,7 @@ server:
   listen_port: 6188 # Тільки порт HTTP
   tls_port: 6443 # Порт HTTPS
   prometheus_port: 9090 # Порт для Prometheus метрик
-  log_level: "debug" # Рівень деталізації
+  log_level: "info" # Production: "warn". Debug деталі: "debug"
   # Global Timeouts (Fallback for Upstreams)
   # timeouts:
   #   connect: 5

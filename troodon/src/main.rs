@@ -40,14 +40,21 @@ fn main() {
     let opt = pingora::server::configuration::Opt::default();
     let mut troodon_server = Server::new(Some(opt)).unwrap();
 
+    // #13: Налаштовуємо Graceful Shutdown drain period.
+    // При SIGTERM Pingora: 1) зупиняє прийом нових з'єднань
+    // 2) чекає grace_period щоб in-flight запити завершились
+    // 3) після graceful_shutdown_timeout — kills Примусово закриває все
+    if let Some(server_conf) = Arc::get_mut(&mut troodon_server.configuration) {
+        server_conf.grace_period_seconds = Some(30);
+        server_conf.graceful_shutdown_timeout_seconds = Some(60);
+    }
+
     // Налаштовуємо глобальні ліміти
     if let Some(max_conn) = conf.server.global_connections {
-        // Pingora's native worker count defaults to 1 per CPU
-        // We will just let Pingora handle this organically based on OS fd limits,
-        // as `ServerConf` doesn't strictly have a `max_connections` parameter exposed natively.
-        // Instead, we will log that we rely on OS ulimit for this.
+        // global_connections тепер enforce'ується через Inflight в request_filter.
+        // ulimit -n має бути >= max_conn для нормальної роботи.
         info!(
-            "Global max connections set to {}, ensure OS ulimit (`ulimit -n`) is configured appropriately.",
+            "🔒 Global connection limit set to {}. Enforced via Inflight guard (returns 429 on overflow).",
             max_conn
         );
     }

@@ -1,39 +1,51 @@
 # 🦖 Troodon Edge Proxy
 
-![Troodon](https://img.shields.io/badge/Status-Active%20Development-success)
+![Status](https://img.shields.io/badge/Status-Active%20Development-success)
 ![Data Plane](https://img.shields.io/badge/Data%20Plane-Rust%20(Pingora)-orange)
 ![Control Plane](https://img.shields.io/badge/Control%20Plane-Go-blue)
 
-**Troodon** — це високопродуктивний Edge Proxy, розроблений для забезпечення максимальної швидкості, безкомпромісної безпеки та гнучкості. Ми будуємо інфраструктуру майбутнього з динамічною конфігурацією та закладеною архітектурою під eBPF-плагіни для блискавичної фільтрації трафіку.
+**Troodon** — високопродуктивний Edge Proxy на **Rust** (Pingora), розроблений для максимальної швидкості, безпеки та гнучкості. Архітектура: Rust Data Plane + Go Control Plane + eBPF-плагіни (roadmap).
 
-## 🌟 Чому Troodon? (The Engineering Excellence)
-- **Blazing Fast Data Plane:** Написаний на **Rust** із використанням фреймворку [Pingora](https://github.com/cloudflare/pingora) від Cloudflare. Повний Zero-copy стрімінг та 100% асинхронність.
-- **Smart Control Plane:** Легковажна та надійна система управління написана на **Go**.
-- **Rock-Solid L7 Security:** Вбудований захист від HTTP-атак (напр., Slowloris), запобігання OOM через суворе лімітування розміру заголовків та надійний Circuit Breaker на базі `pingora-limits`.
-- **Cascading Timeouts & Connection Pooling:** Просунута ієрархія тайм-аутів. Можливість визначати індивідуальні профілі тайм-аутів для кожного маршруту (напр. вічні з'єднання для WebSockets та короткі для REST API). Розумне перевикористання з'єднань (Keep-Alive) з бекендами з коробки.
-- **Fast & Safe TLS Termination:** Завдяки інтеграції `rustls`, сертифікати шаряться між потоками без блокувань (Arc) та без I/O звернень до диска на гарячому шляху.
+## 🌟 Ключові можливості
+
+- **Blazing Fast Data Plane:** Rust + [Pingora](https://github.com/cloudflare/pingora) (Cloudflare). Zero-copy streaming, 100% async.
+- **Radix Tree Routing:** O(k) маршрутизація через `matchit` — prefix та exact-match маршрути.
+- **Rock-Solid L7 Security:** Slowloris protection (client read timeout), OOM protection (max header size), реальний enforcement global connection limit (→ HTTP 429).
+- **Cascading Timeouts:** Ієрархія тайм-аутів server → location. Індивідуальні профілі для WebSocket (hours), REST (seconds), AI endpoints (minutes).
+- **Circuit Breaker:** Inflight-ліміт на бекенд через `pingora-limits` (→ HTTP 503).
+- **Active HTTP Health Checks:** Реальні HTTP-перевірки (не TCP-only) з налаштованим `health_check_path`. Фонова служба кожні 5 секунд.
+- **WebSocket Support:** Автоматичний forward `Upgrade`/`Connection` заголовків при `websocket: true`.
+- **TLS Termination:** OpenSSL через Pingora. Upstream TLS через явний `upstream_tls` або автодетект по порту 443.
+- **Hot Reload (SIGHUP):** Атомарна заміна routing table без даунтайму через `ArcSwap`.
+- **Graceful Shutdown (SIGTERM):** Drain period 30s, force-close 60s.
+- **Distributed Tracing:** Автоматичний `X-Request-Id` (атомарний hex лічильник) у кожному запиті та access log.
+- **Prometheus Metrics:** `troodon_http_requests_total`, `troodon_http_request_duration_seconds` з лейблами method/status/host.
+- **Body Size Limiting:** `client_max_body_size` per-location (→ HTTP 413).
 
 ## 📚 Документація
 
-Ми не тільки пишемо топ-код, але й створюємо детальну документацію. Ознайомтеся з нашими гайдами:
+- 🛡️ **[Конфігурація (Config Reference)](./troodon/CONFIG_REFERENCE.md)** — всі параметри config.yaml: L7 security, timeouts, WebSocket, circuit breakers, tracing.
+- 🔒 **[TLS (HTTPS Termination)](./troodon/TLS_REFERENCE.md)** — downstream і upstream TLS, `upstream_tls` прапорець.
 
-- 🛡️ **[Захист та Балансування (L7 Security & Timeouts)](./troodon/CONFIG_REFERENCE.md)** — Як налаштувати захист від Script Kiddies, ліміти коннектів та ієрархічно керувати пулами тайм-аутів.
-- 🔒 **[Налаштування TLS (HTTPS Termination)](./troodon/TLS_REFERENCE.md)** — Інструкції з увімкнення "зеленого замочка" для ваших клієнтів та проксіювання безпечного трафіку до бекендів.
+## 🚀 Швидкий старт
 
-## 🚀 Швидкий старт (Data Plane)
+```bash
+cd troodon
+cargo run --release
+```
 
-1. Перейдіть у робочу директорію Data Plane:
-   ```bash
-   cd troodon
-   ```
-2. Зберіть та запустіть оптимізований сервер:
-   ```bash
-   cargo run --release
-   ```
+Для hot-reload без рестарту:
+```bash
+kill -HUP $(pgrep troodon)
+```
 
 ## 🏗️ Поточний статус
-* **Data Plane (Rust):** Впроваджено базовий HTTP-фільтр, Radix-роутинг, активні Health Checks у фонових сервісах, підтримку Prometheus метрик, L7 Security та Connection Pooling.
-* **Control Plane (Go):** Фаза архітектурного проектування. 
+
+| Компонент | Статус | Деталі |
+|---|---|---|
+| **Data Plane (Rust)** | ✅ Stage 1 Complete | HTTP proxy, Radix routing, L7 security, TLS, WebSocket, Health Checks, Prometheus, Hot Reload, Graceful Shutdown, X-Request-Id, Body Limit, Circuit Breaker |
+| **Control Plane (Go)** | 🔧 In Design | gRPC API для динамічного оновлення конфігурації |
+| **eBPF Plugins** | 📋 Roadmap | Kernel-level traffic filtering |
 
 ---
-*Built with ❤️ for ultimate performance by top-tier engineers.*
+*Built with ❤️ for ultimate performance.*

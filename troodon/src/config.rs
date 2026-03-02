@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use tracing::warn;
 
 // --- ГОЛОВНА СТРУКТУРА ---
 #[derive(Debug, Deserialize)]
@@ -38,13 +39,12 @@ pub struct ServerConfig {
 }
 
 fn default_log_level() -> String {
-    // Використовуємо eprintln!, щоб додати новий рядок
-    eprintln!("⚠️ [WARN] 'log_level' missing in config. Defaulting to 'info'.");
+    warn!("'log_level' missing in config. Defaulting to 'info'.");
     "info".to_string()
 }
 
 fn default_port() -> u16 {
-    eprintln!("⚠️ [WARN] 'listen_port' missing in config. Defaulting to 6188.");
+    warn!("'listen_port' missing in config. Defaulting to 6188.");
     6188
 }
 
@@ -60,9 +60,8 @@ pub struct Timeouts {
 
 impl Default for Timeouts {
     fn default() -> Self {
-        // Форматуємо гарно, щоб не ламати консоль
-        eprintln!(
-            "⚠️ [WARN] Timeouts not fully specified. Using defaults: connect=5s, read=10s, write=10s, idle=30s."
+        warn!(
+            "Timeouts not fully specified. Using defaults: connect=5s, read=10s, write=10s, idle=30s."
         );
         Timeouts {
             connect: 5,
@@ -95,10 +94,8 @@ pub struct Route {
 }
 
 fn default_host() -> String {
-    // ВАЖЛИВО: SNI не може бути "*".
-    // Для тесту використовуємо one.one.one.one, в реальності тут може бути пустий рядок,
-    // який ми обробимо як "не надсилати SNI".
-    eprintln!("⚠️ [WARN] Route 'host' missing. Defaulting to 'one.one.one.one' (Cloudflare).");
+    // SNI не може бути "*". Пустий рядок = не надсилати SNI.
+    warn!("Route 'host' missing. Defaulting to 'one.one.one.one'.");
     "one.one.one.one".to_string()
 }
 
@@ -123,26 +120,26 @@ pub struct Location {
     // Шлях для Active Health Check (якщо None, тоді Active Health Check вимкнено)
     pub health_check_path: Option<String>,
 
-    // Кількість спроб повтору запиту (Retries), якщо бекенд лежить
-    pub retry_count: Option<usize>,
+    // Кількість спроб повтору запиту (Retries), якщо бекенд лежить (0 = не ретраїти)
+    #[serde(default)]
+    pub retry_count: usize,
 
     // Максимальна кількість одночасних запитів (inflight) до одного бекенду (pingora-limits)
     pub max_inflight: Option<isize>,
 
+    // Явний TLS-прапорець для upstream (якщо None — визначається автоматично по порту 443)
+    pub upstream_tls: Option<bool>,
+
     // Optional location-level timeouts (overrides global)
     pub timeouts: Option<Timeouts>,
 
-    pub settings: Option<LocationSettings>,
+    // Максимальний розмір тіла запиту клієнта (байти). Якщо Content-Length перевищує — 413.
+    pub client_max_body_size: Option<usize>,
 }
 
 fn default_host_path() -> String {
-    eprintln!("⚠️ [WARN] Location path missing. Defaulting to '/'.");
+    warn!("Location path missing. Defaulting to '/'.");
     "/".to_string()
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LocationSettings {
-    pub client_max_body_size: Option<usize>,
 }
 
 // --- LOADER ---

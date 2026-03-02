@@ -2,6 +2,7 @@ use crate::config;
 use crate::proxy::{ProxyRoute, ProxyRouter};
 use matchit::Router;
 use pingora::lb::LoadBalancer;
+use pingora::lb::health_check::HttpHealthCheck;
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -32,12 +33,18 @@ pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
             };
 
             // Вмикаємо Health Checking у фоні (Active Health Check)
-            if loc.health_check_path.is_some() {
-                let hc = pingora::lb::health_check::TcpHealthCheck::new();
-                lb.set_health_check(hc);
+            if let Some(ref hc_path) = loc.health_check_path {
+                // Визначаємо TLS для health check аналогічно proxy.rs
+                let hc_tls = loc.upstream_tls.unwrap_or(false);
+                let mut hc = HttpHealthCheck::new(&sni_host, hc_tls);
+                // Налаштовуємо шлях health check
+                if let Ok(uri) = hc_path.parse() {
+                    hc.req.set_uri(uri);
+                }
+                lb.set_health_check(Box::new(hc));
                 info!(
-                    "🔬 Enabled TCP Health Check for Upstreams in Location: {}",
-                    loc.path
+                    "🔬 Enabled HTTP Health Check (path: '{}') for Location: {}",
+                    hc_path, loc.path
                 );
             }
 
@@ -57,11 +64,15 @@ pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
 
             let proxy_route = Arc::new(ProxyRoute {
                 path: loc.path.clone(),
-                lb: lb_arc.clone(), // Use lb_arc here
+                lb: lb_arc.clone(),
                 sni: sni_host.clone(),
                 strip_prefix: loc.strip_prefix,
                 max_inflight: loc.max_inflight,
                 timeouts: loc_timeouts,
+                retry_count: loc.retry_count,
+                upstream_tls: loc.upstream_tls,
+                websocket: loc.websocket,
+                client_max_body_size: loc.client_max_body_size,
             });
 
             let path = loc.path.clone();

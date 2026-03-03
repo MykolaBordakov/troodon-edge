@@ -1,47 +1,55 @@
-# Конфігураційний файл для Troodon Load Balancer Приклад
+# Конфігураційний файл для Troodon Load Balancer
 server:
-  listen_addr: "0.0.0.0" # Тільки IP
-  listen_port: 6188 # Тільки порт HTTP
-  tls_port: 6443 # Порт HTTPS
-  prometheus_port: 9090 # Порт для Prometheus метрик
-  log_level: "info" # Production: "warn". Debug деталі: "debug"
-  # Global Timeouts (Fallback for Upstreams)
-  # timeouts:
-  #   connect: 5
-  #   read: 10
-  #   write: 10
-  #   idle: 30
+  listen_addr: "0.0.0.0"
+  listen_port: 6188
+  prometheus_port: 9090
+  log_level: "info" # Production: "warn"
 
-  # L7 Security Limits (Downstream connections from Internet)
-  client_read_timeout: 10 # Seconds (Read Header Timeout)
-  max_header_size: 8192 # Bytes (Max Header Size)
+  # L7 Security Limits
+  client_read_timeout: 10 # Seconds (Read Header Timeout, Slowloris protection)
+  max_header_size: 8192 # Bytes (Max Header Size, OOM protection)
   global_connections: 50000 # Global Concurrency Limit
 
-tls:
-  certificates:
-    test_cert:
-      cert: "test.crt"
-      key: "test.key"
+# Порт для HTTPS. Один порт — багато доменів через SNI.
+# Кожен route з блоком `tls:` обслуговується на цьому порту зі своїм сертифікатом.
+# Якщо не задано — HTTPS вимкнено.
+tls_port: 6443
 
 routes:
-  - host: "one.one.one.one"
+  # HTTPS маршрут з власним сертифікатом
+  - host: "api.example.com"
+    tls:
+      cert: "test.crt"
+      key: "test.key"
     locations:
-      - path: "/dummy"
-        exact_match: true
+      - path: "/api"
+        upstreams: ["1.1.1.1:443"]
+        health_check_path: "/"
+        retry_count: 2
+        upstream_tls: true
+
+  # Ще один домен — свій сертифікат
+  - host: "admin.example.com"
+    tls:
+      cert: "test.crt" # У реальному середовищі — окремий сертифікат
+      key: "test.key"
+    locations:
+      - path: "/"
         upstreams: ["127.0.0.1:8000"]
         health_check_path: "/"
         retry_count: 3
-        # Override global timeouts explicitly for this location explicitly
         timeouts:
           connect: 2
           read: 5
           write: 5
           idle: 10
-      - path: "/api"
-        upstreams: ["1.1.1.1:443"] # Робочий Cloudflare
-        health_check_path: "/"
-        retry_count: 2
-      - path: "/"
-        upstreams: ["127.0.0.1:8000"] # Наш локальний сервер
+
+  # HTTP маршрут без TLS (внутрішній сервіс)
+  - host: "internal.svc"
+    # tls: відсутній = тільки HTTP
+    locations:
+      - path: "/dummy"
+        exact_match: true
+        upstreams: ["127.0.0.1:8000"]
         health_check_path: "/"
         retry_count: 3

@@ -3,14 +3,16 @@ mod config;
 mod proxy;
 mod router;
 
-// Імпортуємо нову структуру ProxyRoute
 use arc_swap::ArcSwap;
+use openssl::ssl::{NameType, SslContextBuilder, SslFiletype, SslMethod};
+use pingora::listeners::tls::TlsSettings;
 use pingora::prelude::*;
 use pingora::proxy::http_proxy_service;
 use pingora::services::background::background_service;
 use pingora::services::listening::Service;
 use proxy::LB;
 use router::build_router;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
@@ -28,7 +30,7 @@ fn main() {
     // 2. ЛОГУВАННЯ
     let env_filter = tracing_subscriber::EnvFilter::new(&conf.server.log_level);
     tracing_subscriber::fmt()
-        .json() // JSON формат для продакшена/парсингу
+        .json()
         .with_env_filter(env_filter)
         .init();
 
@@ -39,19 +41,14 @@ fn main() {
     let mut troodon_server =
         Server::new(Some(opt)).expect("Failed to initialize Pingora server. Check configuration.");
 
-    // #13: Налаштовуємо Graceful Shutdown drain period.
-    // При SIGTERM Pingora: 1) зупиняє прийом нових з'єднань
-    // 2) чекає grace_period щоб in-flight запити завершились
-    // 3) після graceful_shutdown_timeout — kills Примусово закриває все
+    // Налаштовуємо Graceful Shutdown drain period.
     if let Some(server_conf) = Arc::get_mut(&mut troodon_server.configuration) {
         server_conf.grace_period_seconds = Some(30);
         server_conf.graceful_shutdown_timeout_seconds = Some(60);
     }
 
-    // Налаштовуємо глобальні ліміти
+    // Глобальні ліміти
     if let Some(max_conn) = conf.server.global_connections {
-        // global_connections тепер enforce'ується через Inflight в request_filter.
-        // ulimit -n має бути >= max_conn для нормальної роботи.
         info!(
             "🔒 Global connection limit set to {}. Enforced via Inflight guard (returns 429 on overflow).",
             max_conn
@@ -70,8 +67,6 @@ fn main() {
     let server_config = Arc::new(conf.server);
 
     // 4. ФОНОВИЙ ЗАДАЧА ДЛЯ HOT RELOAD (SIGHUP)
-    // Pingora створює свій власний Tokio runtime під капотом,
-    // тому використовуємо std::thread і створюємо окремий маленький runtime для фонової задачі
     //
     // ⚠️  ВАЖЛИВО: Hot reload оновлює ТІЛЬКИ таблицю маршрутів (routes).
     // Зміни в `server` секції конфігу (log_level, global_connections, timeouts тощо)
@@ -115,33 +110,97 @@ fn main() {
 
     let mut lb_service = http_proxy_service(&troodon_server.configuration, lb_instance);
 
+    // 6. HTTP СЛУХАЧ
     let bind_addr = format!(
         "{}:{}",
         server_config.listen_addr, server_config.listen_port
     );
     info!("Troodon is binding to TCP (HTTP): {}", bind_addr);
-
     lb_service.add_tcp(&bind_addr);
 
-    // Додаємо TLS (HTTPS) слухача, якщо конфігурація присутня
-    if let (Some(tls_port), Some(tls_config)) = (server_config.tls_port, &conf.tls) {
-        if let Some((_, cert_cfg)) = tls_config.certificates.iter().next() {
-            let tls_bind_addr = format!("{}:{}", server_config.listen_addr, tls_port);
+    // 7. HTTPS / TLS СЛУХАЧ — SNI-based multi-cert
+    // Кожен route може мати свій сертифікат. Один порт — багато доменів.
+    if let Some(tls_port) = conf.tls_port {
+        // Збираємо всі routes з TLS конфігурацією
+        let tls_routes: Vec<(String, String, String)> = conf
+            .routes
+            .iter()
+            .filter_map(|r| {
+                r.tls
+                    .as_ref()
+                    .map(|t| (r.host.clone(), t.cert.clone(), t.key.clone()))
+            })
+            .collect();
 
-            // Pingora має вбудований метод add_tls для простих сертифікатів
-            if let Err(e) = lb_service.add_tls(&tls_bind_addr, &cert_cfg.cert, &cert_cfg.key) {
-                error!("❌ Failed to bind TLS on {}: {}", tls_bind_addr, e);
-            } else {
-                info!("🔒 Troodon is binding to TLS (HTTPS): {}", tls_bind_addr);
-            }
+        if tls_routes.is_empty() {
+            warn!(
+                "⚠️ tls_port is set to {} but no routes have TLS configured. Skipping HTTPS listener.",
+                tls_port
+            );
         } else {
-            warn!("⚠️ TLS config present but no certificates found.");
+            let tls_addr = format!("{}:{}", server_config.listen_addr, tls_port);
+
+            // Будуємо main TlsSettings з першим сертифікатом (default fallback для SNI miss)
+            let (first_host, first_cert, first_key) = &tls_routes[0];
+            match TlsSettings::intermediate(first_cert, first_key) {
+                Ok(mut tls_settings) => {
+                    // Пре-будуємо SslContext для кожного домену через openssl SslContextBuilder.
+                    // Це уникає file I/O під час TLS handshake — всі cert завантажені на старті.
+                    let mut sni_map: HashMap<String, Arc<openssl::ssl::SslContext>> =
+                        HashMap::new();
+
+                    for (host, cert, key) in &tls_routes {
+                        let ctx_result = (|| -> anyhow::Result<openssl::ssl::SslContext> {
+                            let mut b = SslContextBuilder::new(SslMethod::tls_server())?;
+                            b.set_certificate_chain_file(cert)?;
+                            b.set_private_key_file(key, SslFiletype::PEM)?;
+                            Ok(b.build())
+                        })();
+
+                        match ctx_result {
+                            Ok(ctx) => {
+                                sni_map.insert(host.clone(), Arc::new(ctx));
+                                info!("🔒 TLS cert loaded for domain: {}", host);
+                            }
+                            Err(e) => {
+                                error!("❌ Failed to load TLS cert for domain '{}': {}", host, e);
+                            }
+                        }
+                    }
+
+                    let sni_map = Arc::new(sni_map);
+
+                    // SNI callback: вибираємо правильний SslContext по hostname клієнта
+                    tls_settings.set_servername_callback(move |ssl, _| {
+                        if let Some(name) = ssl.servername(NameType::HOST_NAME) {
+                            if let Some(ctx) = sni_map.get(name) {
+                                // Ігноруємо помилку — клієнт отримає default cert
+                                let _ = ssl.set_ssl_context(ctx);
+                            }
+                        }
+                        Ok(())
+                    });
+
+                    lb_service.add_tls_with_settings(&tls_addr, None, tls_settings);
+                    info!(
+                        "🔒 Troodon is binding to TLS (HTTPS): {} ({} domain(s))",
+                        tls_addr,
+                        tls_routes.len()
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "❌ Failed to load default TLS cert for '{}': {}. HTTPS listener NOT started.",
+                        first_host, e
+                    );
+                }
+            }
         }
     }
 
     troodon_server.add_service(lb_service);
 
-    // Включаємо Prometheus, якщо вказаний порт
+    // 8. PROMETHEUS
     if let Some(prom_port) = server_config.prometheus_port {
         let mut prom_service = Service::prometheus_http_service();
         let prom_addr = format!("{}:{}", server_config.listen_addr, prom_port);
@@ -150,7 +209,7 @@ fn main() {
         info!("📊 Prometheus metrics exposed on TCP: {}", prom_addr);
     }
 
-    // Оголошуємо та реєструємо нативний фоновий сервіс Health Check
+    // 9. HEALTH CHECK BACKGROUND SERVICE
     let hc_service = background_service(
         "router_health_check",
         background::RouterHealthCheck {

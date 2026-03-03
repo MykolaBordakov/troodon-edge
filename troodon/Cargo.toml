@@ -37,3 +37,4 @@ http = "1.4.0"
 pingora-limits = "0.7.0"
 prometheus = "0.13"
 bytes = "1.11.1"
+openssl = { version = "0.10.75", features = ["v102", "v110"] }

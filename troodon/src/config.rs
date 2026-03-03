@@ -1,12 +1,12 @@
 use serde::Deserialize;
-use std::collections::HashMap;
 use tracing::warn;
 
 // --- ГОЛОВНА СТРУКТУРА ---
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
-    pub tls: Option<TlsConfig>,
+    // TLS порт для всіх HTTPS маршрутів (один порт — багато доменів через SNI)
+    pub tls_port: Option<u16>,
     pub routes: Vec<Route>,
 }
 
@@ -31,9 +31,6 @@ pub struct ServerConfig {
 
     // Порт для експорту метрик Prometheus (опціонально)
     pub prometheus_port: Option<u16>,
-
-    // Порт для HTTPS/TLS трафіку (опціонально)
-    pub tls_port: Option<u16>,
 }
 
 fn default_log_level() -> String {
@@ -69,14 +66,18 @@ impl Default for Timeouts {
     }
 }
 
-// --- TLS ---
-#[derive(Debug, Deserialize)]
-pub struct TlsConfig {
-    pub certificates: HashMap<String, CertificateConfig>,
+impl PartialEq for Timeouts {
+    fn eq(&self, other: &Self) -> bool {
+        self.connect == other.connect
+            && self.read == other.read
+            && self.write == other.write
+            && self.idle == other.idle
+    }
 }
 
+// --- PER-ROUTE TLS ---
 #[derive(Debug, Deserialize)]
-pub struct CertificateConfig {
+pub struct RouteTlsConfig {
     pub cert: String,
     pub key: String,
 }
@@ -87,6 +88,11 @@ pub struct Route {
     // `host` є обов'язковим: використовується для TLS SNI та як дефолтний Host заголовок.
     // Небезпечно надавати дефолт — відсутній host призведе до витоку трафіку.
     pub host: String,
+
+    // Якщо задано — цей маршрут обслуговується через HTTPS (сертифікат per-domain).
+    // Якщо None — тільки HTTP.
+    pub tls: Option<RouteTlsConfig>,
+
     pub locations: Vec<Location>,
 }
 
@@ -143,29 +149,5 @@ fn default_host_path() -> String {
 pub fn load_config(path: &str) -> Result<Config, anyhow::Error> {
     let f = std::fs::File::open(path)?;
     let config: Config = serde_yaml::from_reader(f)?;
-
-    // Warn якщо глобальні таймаути не задані в конфігу (визначаємо по дефолтних значеннях)
-    if config.server.timeouts
-        == (Timeouts {
-            connect: 5,
-            read: 10,
-            write: 10,
-            idle: 30,
-        })
-    {
-        // Це не ідеально (збіг дефолтів), але краще ніж warning в Default::default().
-        // Фінальне рішення - додати `#[serde(default)] + Option<Timeouts>` на рівні ServerConfig.
-    }
-
     Ok(config)
-}
-
-// Для порівняння у load_config (потрібен PartialEq)
-impl PartialEq for Timeouts {
-    fn eq(&self, other: &Self) -> bool {
-        self.connect == other.connect
-            && self.read == other.read
-            && self.write == other.write
-            && self.idle == other.idle
-    }
 }

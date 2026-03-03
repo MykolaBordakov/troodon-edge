@@ -1996,6 +1996,7 @@ dependencies = [
  "http",
  "log",
  "matchit",
+ "openssl",
  "pingora",
  "pingora-limits",
  "prometheus",

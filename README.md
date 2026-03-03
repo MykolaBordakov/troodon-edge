@@ -15,12 +15,13 @@
 - **Circuit Breaker:** Inflight-ліміт на бекенд через `pingora-limits` (→ HTTP 503).
 - **Active HTTP Health Checks:** Реальні HTTP-перевірки (не TCP-only) з налаштованим `health_check_path`. Фонова служба кожні 5 секунд.
 - **WebSocket Support:** Автоматичний forward `Upgrade`/`Connection` заголовків при `websocket: true`.
-- **TLS Termination:** OpenSSL через Pingora. Upstream TLS через явний `upstream_tls` або автодетект по порту 443.
+- **Multi-Domain TLS (SNI):** Per-route сертифікати — кожен домен має свій cert/key. Один HTTPS порт обслуговує N доменів. Строга SNI перевірка: невідомий домен або відсутній SNI → `TLS ALERT_FATAL`.
+- **Upstream TLS:** Явний `upstream_tls` або автодетект по порту 443. Підтримка `host_header` для розділення SNI і Host заголовку.
 - **Hot Reload (SIGHUP):** Атомарна заміна routing table без даунтайму через `ArcSwap`.
 - **Graceful Shutdown (SIGTERM):** Drain period 30s, force-close 60s.
-- **Distributed Tracing:** Автоматичний `X-Request-Id` (атомарний hex лічильник) у кожному запиті та access log.
-- **Prometheus Metrics:** `troodon_http_requests_total`, `troodon_http_request_duration_seconds` з лейблами method/status/host.
-- **Body Size Limiting:** `client_max_body_size` per-location (→ HTTP 413).
+- **Distributed Tracing:** Автоматичний `X-Request-Id` у форматі `{epoch}-{counter}` — унікальний між рестартами та інстансами.
+- **Prometheus Metrics:** `troodon_http_requests_total`, `troodon_http_request_duration_seconds`. Статус групується як `2xx/3xx/4xx/5xx`.
+- **Body Size Limiting:** Real enforcement через `request_body_filter` — захищає від chunked encoding bypass (→ HTTP 413).
 
 ## 📚 Документація
 
@@ -43,7 +44,7 @@ kill -HUP $(pgrep troodon)
 
 | Компонент | Статус | Деталі |
 |---|---|---|
-| **Data Plane (Rust)** | ✅ Stage 1 Complete | HTTP proxy, Radix routing, L7 security, TLS, WebSocket, Health Checks, Prometheus, Hot Reload, Graceful Shutdown, X-Request-Id, Body Limit, Circuit Breaker |
+| **Data Plane (Rust)** | ✅ Stage 1 Complete | HTTP proxy, Radix routing, L7 security, Multi-domain SNI TLS, WebSocket, Health Checks, Prometheus (2xx/3xx/4xx/5xx grouping), Hot Reload (routes-only), Graceful Shutdown, X-Request-Id (epoch+counter), Body Limit (chunked-safe), Circuit Breaker, host_header decoupling |
 | **Control Plane (Go)** | 🔧 In Design | gRPC API для динамічного оновлення конфігурації |
 | **eBPF Plugins** | 📋 Roadmap | Kernel-level traffic filtering |
 

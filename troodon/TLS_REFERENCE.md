@@ -2,38 +2,81 @@
 
 ## 1. Архітектура
 
-Troodon використовує **OpenSSL** (через Pingora) для TLS termination. Сертифікати завантажуються один раз при старті та кешуються в пам'яті через `Arc` — без I/O на гарячому шляху.
+Troodon використовує **OpenSSL** (через Pingora) для TLS termination. Підтримується **SNI-based multi-cert** — кожен домен отримує свій власний сертифікат на одному порту.
 
-## 2. Увімкнення Downstream TLS (клієнт → Troodon)
+**Як це працює:**
+1. При старті всі сертифікати завантажуються у пам'ять через `SslContextBuilder` (zero I/O на гарячому шляху)
+2. Клієнт підключається й надсилає SNI (Extension в TLS ClientHello)
+3. Troodon знаходить відповідний `SslContext` і повертає правильний сертифікат
+4. **Немає SNI або невідомий домен → `TLS ALERT_FATAL`** — без дефолтних сертифікатів
+
+---
+
+## 2. Downstream TLS (клієнт → Troodon)
+
+TLS конфігурується **на рівні route**, а не глобально. Кожен домен — свій сертифікат.
 
 ```yaml
-server:
-  listen_addr: "0.0.0.0"
-  listen_port: 6188     # HTTP
-  tls_port: 6443        # HTTPS
+# Глобальний HTTPS порт (один на всі домени)
+tls_port: 6443
 
-tls:
-  certificates:
-    main_app:
-      cert: "/etc/ssl/certs/troodon.crt"   # PEM Full Chain
-      key: "/etc/ssl/private/troodon.key"  # PEM Private Key (без паролю)
+routes:
+  # Домен 1 — свій сертифікат
+  - host: "api.example.com"
+    tls:
+      cert: "/etc/ssl/certs/api.crt"    # PEM Full Chain
+      key:  "/etc/ssl/private/api.key"  # PEM Private Key (без паролю)
+    locations:
+      - path: "/api"
+        upstreams: ["backend:8080"]
+
+  # Домен 2 — інший сертифікат, той самий порт
+  - host: "admin.example.com"
+    tls:
+      cert: "/etc/ssl/certs/admin.crt"
+      key:  "/etc/ssl/private/admin.key"
+    locations:
+      - path: "/"
+        upstreams: ["admin-backend:9000"]
+
+  # Без TLS — тільки HTTP (через port 6188)
+  - host: "internal.svc"
+    # tls: відсутній = тільки HTTP
+    locations:
+      - path: "/"
+        upstreams: ["internal:3000"]
 ```
 
 ### Формати файлів
 
-- **`cert`**: файл `.crt`/`.pem` з блоком `-----BEGIN CERTIFICATE-----`. Рекомендується Full Chain (сертифікат домену + проміжний CA).
-- **`key`**: файл `.key`/`.pem` з блоком `-----BEGIN PRIVATE KEY-----`. Пароль на ключі не підтримується.
+- **`cert`**: `.crt`/`.pem` з `-----BEGIN CERTIFICATE-----`. Рекомендується Full Chain (домен + проміжний CA).
+- **`key`**: `.key`/`.pem` з `-----BEGIN PRIVATE KEY-----`. Пароль на ключі **не підтримується**.
+
+### SNI — строга перевірка
+
+| Ситуація | Результат |
+|---|---|
+| SNI є, домен налаштований | ✅ Отримує правильний сертифікат |
+| SNI є, домен **не** налаштований | ❌ `TLS ALERT_FATAL` |
+| SNI **відсутній** (старі клієнти) | ❌ `TLS ALERT_FATAL` |
+
+> **Примітка:** Всі сучасні браузери та HTTP клієнти надсилають SNI. Відсутність SNI означає застарілий або некоректний клієнт.
 
 ### Перевірка
 
 ```bash
-# -k потрібен для самопідписаного сертифіката (тест)
+# Тест з конкретним SNI
+curl -v -k --resolve api.example.com:6443:127.0.0.1 https://api.example.com:6443/api
+
+# Самопідписаний сертифікат (dev)
 curl -v -k https://127.0.0.1:6443/api
 ```
 
 Лог при успішному старті:
 ```
-🔒 Troodon is binding to TLS (HTTPS): 0.0.0.0:6443
+🔒 TLS cert loaded for domain: api.example.com
+🔒 TLS cert loaded for domain: admin.example.com
+🔒 Troodon is binding to TLS (HTTPS): 0.0.0.0:6443 (2 domain(s))
 ```
 
 ---
@@ -62,6 +105,13 @@ routes:
         upstream_tls: false         # Явно вимкнути TLS
 ```
 
-> **Примітка:** Параметр `upstream_tls` має пріоритет над автодетектом по порту. Якщо відсутній — Troodon вмикає TLS тільки при порту 443.
+> **Примітка:** `upstream_tls` має пріоритет над автодетектом. SNI для upstream передається з поля `host` маршруту (або `host_header`, якщо заданий).
 
-SNI передається бекенду автоматично на основі поля `host` маршруту.
+---
+
+## 4. Генерація тестового сертифіката
+
+```bash
+openssl req -x509 -newkey rsa:4096 -keyout test.key -out test.crt \
+  -days 365 -nodes -subj "/CN=localhost"
+```

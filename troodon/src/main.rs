@@ -3,6 +3,9 @@ mod config;
 mod proxy;
 mod router;
 
+#[cfg(test)]
+mod tests;
+
 use arc_swap::ArcSwap;
 use openssl::ssl::{NameType, SslContextBuilder, SslFiletype, SslMethod};
 use pingora::listeners::tls::TlsSettings;

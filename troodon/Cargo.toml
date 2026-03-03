@@ -38,3 +38,11 @@ pingora-limits = "0.8.0"
 prometheus = { version = "0.13", default-features = false }
 bytes = "1.11.1"
 openssl = { version = "0.10.75", features = ["v102", "v110"] }
+
+[dev-dependencies]
+reqwest = "0.12"
+warp = "0.3"
+
+[[bin]]
+name = "mock_target"
+path = "tests/mock_target.rs"

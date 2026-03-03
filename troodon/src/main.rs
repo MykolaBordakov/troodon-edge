@@ -119,9 +119,8 @@ fn main() {
     lb_service.add_tcp(&bind_addr);
 
     // 7. HTTPS / TLS СЛУХАЧ — SNI-based multi-cert
-    // Кожен route може мати свій сертифікат. Один порт — багато доменів.
+    // Кожен route може мати свій сертифікат. Один порт — багато доменів через SNI.
     if let Some(tls_port) = conf.tls_port {
-        // Збираємо всі routes з TLS конфігурацією
         let tls_routes: Vec<(String, String, String)> = conf
             .routes
             .iter()
@@ -139,13 +138,18 @@ fn main() {
             );
         } else {
             let tls_addr = format!("{}:{}", server_config.listen_addr, tls_port);
-
-            // Будуємо main TlsSettings з першим сертифікатом (default fallback для SNI miss)
             let (first_host, first_cert, first_key) = &tls_routes[0];
+
             match TlsSettings::intermediate(first_cert, first_key) {
+                Err(e) => {
+                    error!(
+                        "❌ Failed to load default TLS cert for '{}': {}. HTTPS listener NOT started.",
+                        first_host, e
+                    );
+                }
                 Ok(mut tls_settings) => {
                     // Пре-будуємо SslContext для кожного домену через openssl SslContextBuilder.
-                    // Це уникає file I/O під час TLS handshake — всі cert завантажені на старті.
+                    // Уникаємо file I/O під час handshake — всі cert завантажені на старті.
                     let mut sni_map: HashMap<String, Arc<openssl::ssl::SslContext>> =
                         HashMap::new();
 
@@ -170,15 +174,22 @@ fn main() {
 
                     let sni_map = Arc::new(sni_map);
 
-                    // SNI callback: вибираємо правильний SslContext по hostname клієнта
+                    // SNI callback: строга перевірка.
+                    // Без SNI або невідомий домен → ALERT_FATAL.
+                    // Ніяких дефолтних сертифікатів — 2026 рік, IE6 не підтримуємо.
                     tls_settings.set_servername_callback(move |ssl, _| {
-                        if let Some(name) = ssl.servername(NameType::HOST_NAME) {
-                            if let Some(ctx) = sni_map.get(name) {
-                                // Ігноруємо помилку — клієнт отримає default cert
-                                let _ = ssl.set_ssl_context(ctx);
-                            }
+                        match ssl.servername(NameType::HOST_NAME) {
+                            Some(name) => match sni_map.get(name) {
+                                Some(ctx) => {
+                                    let _ = ssl.set_ssl_context(ctx);
+                                    Ok(())
+                                }
+                                // Домен є, але не налаштований → відхиляємо
+                                None => Err(openssl::ssl::SniError::ALERT_FATAL),
+                            },
+                            // Немає SNI взагалі → відхиляємо
+                            None => Err(openssl::ssl::SniError::ALERT_FATAL),
                         }
-                        Ok(())
                     });
 
                     lb_service.add_tls_with_settings(&tls_addr, None, tls_settings);
@@ -186,12 +197,6 @@ fn main() {
                         "🔒 Troodon is binding to TLS (HTTPS): {} ({} domain(s))",
                         tls_addr,
                         tls_routes.len()
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "❌ Failed to load default TLS cert for '{}': {}. HTTPS listener NOT started.",
-                        first_host, e
                     );
                 }
             }

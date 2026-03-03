@@ -18,11 +18,11 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 
 fn main() {
-    // 1. ЗАВАНТАЖЕННЯ
-    let conf = match config::load_config("config.yaml") {
+    let config_path = std::env::var("TROODON_CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
+    let conf = match config::load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("🔥 Fatal error loading config: {}", e);
+            eprintln!("🔥 Fatal error loading config {}: {}", config_path, e);
             std::process::exit(1);
         }
     };
@@ -72,7 +72,9 @@ fn main() {
     // Зміни в `server` секції конфігу (log_level, global_connections, timeouts тощо)
     // НЕ застосовуються без повного перезапуску процесу.
     let hot_reload_router = shared_router.clone();
+    let hot_reload_config_path = config_path.clone();
     std::thread::spawn(move || {
+        let config_path = hot_reload_config_path;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -84,7 +86,7 @@ fn main() {
                 info!("🔄 Received SIGHUP! Reloading config...");
                 warn!("⚠️  Hot reload updates routing table ONLY. Server config changes require a full restart.");
 
-                match config::load_config("config.yaml") {
+                match config::load_config(&config_path) {
                     Ok(new_conf) => {
                         if let Some(new_router) = build_router(&new_conf) {
                             hot_reload_router.store(Arc::new(new_router));

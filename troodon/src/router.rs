@@ -88,11 +88,11 @@ pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
                 // ПРЕФІКСНЕ МАРШРУТИЗУВАННЯ (Напр. /api => /api/ та /api/*)
 
                 // 1. Точний збіг шляху
-                if path != "/" {
-                    if let Err(e) = router.insert(path.clone(), proxy_route.clone()) {
-                        error!("Failed to register exact route '{}': {}", path, e);
-                        continue;
-                    }
+                if path != "/"
+                    && let Err(e) = router.insert(path.clone(), proxy_route.clone())
+                {
+                    error!("Failed to register exact route '{}': {}", path, e);
+                    continue;
                 }
 
                 // 2. Wildcard маршрут для перехоплення всіх внутрішніх шляхів

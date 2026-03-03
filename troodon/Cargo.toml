@@ -12,7 +12,7 @@ tokio = { version = "1", features = ["full"] }
 # - "lb": Load Balancer (базові можливості проксі)
 # - "proxy": HTTP Proxy
 # - "openssl": підтримка TLS/SSL
-pingora = { version = "0.7.0", features = ["lb", "proxy", "openssl"] }
+pingora = { version = "0.8.0", features = ["lb", "proxy", "openssl"] }
 # Для логування (щоб бачити, що відбувається в консолі)
 async-trait = "0.1"
 # === Logging (The "Zap" replacement) ===
@@ -34,7 +34,7 @@ anyhow = "1.0"
 arc-swap = "1.8.2"
 matchit = "0.9.1"
 http = "1.4.0"
-pingora-limits = "0.7.0"
-prometheus = "0.13"
+pingora-limits = "0.8.0"
+prometheus = { version = "0.13", default-features = false }
 bytes = "1.11.1"
 openssl = { version = "0.10.75", features = ["v102", "v110"] }

@@ -338,12 +338,12 @@ impl ProxyHttp for LB {
         }
 
         // X-Real-IP / X-Forwarded-For
-        if let Some(client_ip) = session.client_addr() {
-            if let Some(ip) = client_ip.as_inet() {
-                let ip_str = ip.ip().to_string();
-                upstream_request.insert_header("X-Real-IP", &ip_str)?;
-                upstream_request.insert_header("X-Forwarded-For", &ip_str)?;
-            }
+        if let Some(client_ip) = session.client_addr()
+            && let Some(ip) = client_ip.as_inet()
+        {
+            let ip_str = ip.ip().to_string();
+            upstream_request.insert_header("X-Real-IP", &ip_str)?;
+            upstream_request.insert_header("X-Forwarded-For", &ip_str)?;
         }
 
         // #15: X-Request-Id для distributed tracing

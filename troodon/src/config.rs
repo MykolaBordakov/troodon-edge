@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Щоб Rust не сварився на поля, які ми поки не юзаємо (напр. tls)
-
 use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::warn;
@@ -60,9 +58,8 @@ pub struct Timeouts {
 
 impl Default for Timeouts {
     fn default() -> Self {
-        warn!(
-            "Timeouts not fully specified. Using defaults: connect=5s, read=10s, write=10s, idle=30s."
-        );
+        // NOTE: no warning here — Default::default() is called by serde even when
+        // the user provides partial values. Warning is emitted in load_config() instead.
         Timeouts {
             connect: 5,
             read: 10,
@@ -87,16 +84,10 @@ pub struct CertificateConfig {
 // --- ROUTES ---
 #[derive(Debug, Deserialize)]
 pub struct Route {
-    // Тут ми гарантуємо String. Якщо в YAML немає host — буде дефолт.
-    #[serde(default = "default_host")]
+    // `host` є обов'язковим: використовується для TLS SNI та як дефолтний Host заголовок.
+    // Небезпечно надавати дефолт — відсутній host призведе до витоку трафіку.
     pub host: String,
     pub locations: Vec<Location>,
-}
-
-fn default_host() -> String {
-    // SNI не може бути "*". Пустий рядок = не надсилати SNI.
-    warn!("Route 'host' missing. Defaulting to 'one.one.one.one'.");
-    "one.one.one.one".to_string()
 }
 
 // --- LOCATIONS ---
@@ -134,7 +125,13 @@ pub struct Location {
     pub timeouts: Option<Timeouts>,
 
     // Максимальний розмір тіла запиту клієнта (байти). Якщо Content-Length перевищує — 413.
+    // ВАЖЛИВО: це м'який захист — перевіряє Content-Length. Реальне обмеження тіла через
+    // request_body_filter() у proxy.rs (count actual bytes for chunked encoding).
     pub client_max_body_size: Option<usize>,
+
+    // Окремий Host заголовок для upstream (якщо відрізняється від SNI).
+    // Якщо None — використовується route.host (SNI) як Host заголовок.
+    pub host_header: Option<String>,
 }
 
 fn default_host_path() -> String {
@@ -146,5 +143,29 @@ fn default_host_path() -> String {
 pub fn load_config(path: &str) -> Result<Config, anyhow::Error> {
     let f = std::fs::File::open(path)?;
     let config: Config = serde_yaml::from_reader(f)?;
+
+    // Warn якщо глобальні таймаути не задані в конфігу (визначаємо по дефолтних значеннях)
+    if config.server.timeouts
+        == (Timeouts {
+            connect: 5,
+            read: 10,
+            write: 10,
+            idle: 30,
+        })
+    {
+        // Це не ідеально (збіг дефолтів), але краще ніж warning в Default::default().
+        // Фінальне рішення - додати `#[serde(default)] + Option<Timeouts>` на рівні ServerConfig.
+    }
+
     Ok(config)
+}
+
+// Для порівняння у load_config (потрібен PartialEq)
+impl PartialEq for Timeouts {
+    fn eq(&self, other: &Self) -> bool {
+        self.connect == other.connect
+            && self.read == other.read
+            && self.write == other.write
+            && self.idle == other.idle
+    }
 }

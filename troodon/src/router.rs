@@ -66,6 +66,7 @@ pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
                 path: loc.path.clone(),
                 lb: lb_arc.clone(),
                 sni: sni_host.clone(),
+                host_header: loc.host_header.clone(),
                 strip_prefix: loc.strip_prefix,
                 max_inflight: loc.max_inflight,
                 timeouts: loc_timeouts,

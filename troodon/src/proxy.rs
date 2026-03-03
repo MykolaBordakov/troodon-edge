@@ -7,7 +7,7 @@ use pingora::prelude::*;
 use pingora::upstreams::peer::Peer;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use prometheus::{
@@ -39,6 +39,15 @@ use crate::config::ServerConfig;
 // Лічильник для генерації унікальних Request ID (без зовнішніх залежностей)
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+// Час старту процесу у секундах від Unix Epoch — префікс для Request ID.
+// Гарантує унікальність між рестартами/інстансами (без UUID залежності).
+static PROCESS_START_SECS: LazyLock<u64> = LazyLock::new(|| {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+});
+
 // === СТРУКТУРИ ===
 
 // 1. Опис маршруту (те, що ми підготували в main.rs)
@@ -46,6 +55,8 @@ pub struct ProxyRoute {
     pub path: String,
     pub lb: Arc<LoadBalancer<RoundRobin>>,
     pub sni: String,
+    // Явний Host заголовок для upstream. Якщо None — використовується sni.
+    pub host_header: Option<String>,
     pub strip_prefix: bool,
     pub max_inflight: Option<isize>,
     pub timeouts: crate::config::Timeouts,
@@ -58,17 +69,23 @@ pub struct ProxyRoute {
 // 2. Контекст запиту (наш "кошик" для передачі даних між етапами)
 pub struct ProxyContext {
     pub sni: String,
+    // Значення, яке реально пишеться у заголовок Host upstream запиту
+    pub effective_host: String,
     pub strip_prefix: bool,
     pub path_prefix: String,
     pub inflight_guard: Option<pingora_limits::inflight::Guard>,
     pub start_time: Instant,
     pub retries_left: usize,
-    // #15: Унікальний ID запиту для distributed tracing
+    // Унікальний ID запиту для distributed tracing: <epoch_secs>-<counter>
     pub request_id: String,
-    // #10: Guard глобального ліміту конекцій
+    // Guard глобального ліміту конекцій
     pub global_guard: Option<pingora_limits::inflight::Guard>,
-    // #11: Прапорець WebSocket для спеціальної обробки заголовків
+    // Прапорець WebSocket для спеціальної обробки заголовків
     pub websocket: bool,
+    // Лічильник реального розміру тіла запиту (байти, для chunked encoding)
+    pub body_bytes_received: usize,
+    // Максимально допустимий розмір тіла (None = без обмеження)
+    pub max_body_size: Option<usize>,
 }
 
 // 3. Роутер, який містить Radix-дерево
@@ -93,6 +110,7 @@ impl ProxyHttp for LB {
     fn new_ctx(&self) -> Self::CTX {
         ProxyContext {
             sni: String::new(),
+            effective_host: String::new(),
             strip_prefix: false,
             path_prefix: String::new(),
             inflight_guard: None,
@@ -101,14 +119,18 @@ impl ProxyHttp for LB {
             request_id: String::new(),
             global_guard: None,
             websocket: false,
+            body_bytes_received: 0,
+            max_body_size: None,
         }
     }
 
     // 0. ФІЛЬТР ЗАПИТУ (Рання валідація L7 Security)
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        // #15: Генеруємо унікальний Request ID для кожного запиту
+        // Генеруємо унікальний Request ID для кожного запиту.
+        // Формат: <process_start_epoch_hex>-<counter_hex>.
+        // process_start_epoch гарантує унікальність між рестартами та інстансами.
         let req_num = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        ctx.request_id = format!("{:016x}", req_num);
+        ctx.request_id = format!("{:08x}-{:016x}", *PROCESS_START_SECS, req_num);
 
         // #10: Enforce глобальний ліміт конекцій
         if let Some(max_conn) = self.config.global_connections {
@@ -193,6 +215,11 @@ impl ProxyHttp for LB {
         // === МАГІЯ ТУТ ===
         // Зберігаємо знайдений SNI в контекст, щоб використати пізніше
         ctx.sni = route.sni.clone();
+        // Визначаємо ефективний Host заголовок: явний host_header або SNI
+        ctx.effective_host = route
+            .host_header
+            .clone()
+            .unwrap_or_else(|| route.sni.clone());
         ctx.strip_prefix = route.strip_prefix; // Чи різати?
         ctx.path_prefix = route.path.clone(); // Що різати?
 
@@ -211,13 +238,16 @@ impl ProxyHttp for LB {
             upstream.addr.as_inet()
         );
 
-        // #11: Зберігаємо WebSocket прапорець в контекст
+        // Зберігаємо WebSocket прапорець в контекст
         ctx.websocket = route.websocket;
 
         // Зберігаємо лічильник ретраїв з конфігу маршруту
         ctx.retries_left = route.retry_count;
 
-        // #12: Перевірка розміру тіла запиту через Content-Length
+        // Зберігаємо ліміт тіла в контекст для обробки в request_body_filter().
+        // Швидка перевірка Content-Length (soft check): легко обійти через chunked,
+        // але відсікає "чесних" клієнтів ще до з'єднання з upstream.
+        ctx.max_body_size = route.client_max_body_size;
         if let Some(max_body) = route.client_max_body_size {
             let content_length = session
                 .req_header()
@@ -229,7 +259,7 @@ impl ProxyHttp for LB {
 
             if content_length > max_body {
                 warn!(
-                    "🛑 Request body too large ({} > {} bytes). Returning 413. ReqID={}",
+                    "🛑 Request body too large via Content-Length ({} > {} bytes). Returning 413. ReqID={}",
                     content_length, max_body, ctx.request_id
                 );
                 return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(413)));
@@ -295,10 +325,16 @@ impl ProxyHttp for LB {
         ctx: &mut Self::CTX, // Читаємо контекст
     ) -> Result<()> {
         // --- PRODUCTION HEADERS ---
-        if !ctx.sni.is_empty() {
-            upstream_request.insert_header("Host", &ctx.sni)?;
+        // Використовуємо effective_host (може відрізнятись від SNI через host_header в конфігу)
+        if !ctx.effective_host.is_empty() {
+            upstream_request.insert_header("Host", &ctx.effective_host)?;
         } else {
-            error!("Context SNI is empty, something went wrong internally");
+            // Якщо обидва порожні — щось пішло не так. Логуємо і не надсилаємо Host,
+            // що призведе до 400 на upstream. Це краще ніж тихо надсилати неправильний Host.
+            error!(
+                "effective_host is empty for request ReqID={}. upstream may return 400.",
+                ctx.request_id
+            );
         }
 
         // X-Real-IP / X-Forwarded-For
@@ -367,6 +403,39 @@ impl ProxyHttp for LB {
         Ok(())
     }
 
+    // 2.5. РЕАЛЬНЕ ОБМЕЖЕННЯ РОЗМІРУ ТІЛА (захист від chunked encoding bypass)
+    // Викликається для кожного chunk'а тіла запиту. Рахуємо байти і повертаємо 413
+    // якщо загальний розмір перевищує ліміт. Це захищає навіть від Transfer-Encoding: chunked.
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if let Some(max_body) = ctx.max_body_size {
+            if let Some(chunk) = body {
+                ctx.body_bytes_received += chunk.len();
+                if ctx.body_bytes_received > max_body {
+                    warn!(
+                        "🛑 Request body too large (received {} > {} bytes limit). Returning 413. ReqID={}",
+                        ctx.body_bytes_received, max_body, ctx.request_id
+                    );
+                    // Дропаємо chunk і повертаємо помилку
+                    *body = None;
+                    return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(413)));
+                }
+            }
+            if end_of_stream {
+                debug!(
+                    "Body stream complete: {} bytes received (limit: {}). ReqID={}",
+                    ctx.body_bytes_received, max_body, ctx.request_id
+                );
+            }
+        }
+        Ok(())
+    }
+
     // 3. RETRY ЛОГІКА (Passive Health Checks / Failover)
     // Викликається Pingora, коли не вдалося з'єднатися з upstream_peer.
     // Оскільки ми вже передали `e.set_retry(true)`, Pingora автоматично
@@ -418,23 +487,35 @@ impl ProxyHttp for LB {
             .map(|resp| resp.status.as_u16())
             .unwrap_or(0);
 
-        let status_str = response_code.to_string();
+        // Групуємо статус-коди (2xx, 3xx, 4xx, 5xx) для обмеження cardinality в Prometheus.
+        // Без цього кожен унікальний статус-код (200, 201, 204, 301...) створює окремий time series.
+        let status_class = match response_code {
+            100..=199 => "1xx",
+            200..=299 => "2xx",
+            300..=399 => "3xx",
+            400..=499 => "4xx",
+            500..=599 => "5xx",
+            _ => "unknown",
+        };
+
         let method_str = session.req_header().method.as_str();
 
-        // Host header can be empty, fallback to unknown
-        let host_str = if ctx.sni.is_empty() {
-            "unknown"
+        // Host header: використовуємо effective_host, fallback до SNI
+        let host_str = if !ctx.effective_host.is_empty() {
+            ctx.effective_host.as_str()
+        } else if !ctx.sni.is_empty() {
+            ctx.sni.as_str()
         } else {
-            &ctx.sni
+            "unknown"
         };
 
         // Записуємо статистику у Prometheus
         REQ_COUNTER
-            .with_label_values(&[method_str, &status_str, host_str])
+            .with_label_values(&[method_str, status_class, host_str])
             .inc();
         let duration = ctx.start_time.elapsed().as_secs_f64();
         REQ_DURATION
-            .with_label_values(&[method_str, &status_str, host_str])
+            .with_label_values(&[method_str, status_class, host_str])
             .observe(duration);
 
         if let Some(error) = e {

@@ -5,12 +5,10 @@ mod router;
 
 // Імпортуємо нову структуру ProxyRoute
 use arc_swap::ArcSwap;
-use pingora::services::listening::Service;
-// use matchit::Router;
-// use pingora::lb::LoadBalancer;
 use pingora::prelude::*;
 use pingora::proxy::http_proxy_service;
 use pingora::services::background::background_service;
+use pingora::services::listening::Service;
 use proxy::LB;
 use router::build_router;
 use std::sync::Arc;
@@ -38,7 +36,8 @@ fn main() {
     info!("🦖 Troodon is starting...");
 
     let opt = pingora::server::configuration::Opt::default();
-    let mut troodon_server = Server::new(Some(opt)).unwrap();
+    let mut troodon_server =
+        Server::new(Some(opt)).expect("Failed to initialize Pingora server. Check configuration.");
 
     // #13: Налаштовуємо Graceful Shutdown drain period.
     // При SIGTERM Pingora: 1) зупиняє прийом нових з'єднань
@@ -73,14 +72,22 @@ fn main() {
     // 4. ФОНОВИЙ ЗАДАЧА ДЛЯ HOT RELOAD (SIGHUP)
     // Pingora створює свій власний Tokio runtime під капотом,
     // тому використовуємо std::thread і створюємо окремий маленький runtime для фонової задачі
+    //
+    // ⚠️  ВАЖЛИВО: Hot reload оновлює ТІЛЬКИ таблицю маршрутів (routes).
+    // Зміни в `server` секції конфігу (log_level, global_connections, timeouts тощо)
+    // НЕ застосовуються без повного перезапуску процесу.
     let hot_reload_router = shared_router.clone();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build hot-reload Tokio runtime");
         rt.block_on(async {
             let mut sig = signal(SignalKind::hangup()).expect("Failed to bind SIGHUP");
             loop {
                 sig.recv().await;
                 info!("🔄 Received SIGHUP! Reloading config...");
+                warn!("⚠️  Hot reload updates routing table ONLY. Server config changes require a full restart.");
 
                 match config::load_config("config.yaml") {
                     Ok(new_conf) => {

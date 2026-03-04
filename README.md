@@ -27,6 +27,7 @@
 
 - 🛡️ **[Конфігурація (Config Reference)](./troodon/CONFIG_REFERENCE.md)** — всі параметри config.yaml: L7 security, timeouts, WebSocket, circuit breakers, tracing.
 - 🔒 **[TLS (HTTPS Termination)](./troodon/TLS_REFERENCE.md)** — downstream і upstream TLS, `upstream_tls` прапорець.
+- 📊 **[Метрики (Metrics Reference)](./troodon/METRICS_REFERENCE.md)** — які L7 метрики віддаються Prometheus (RPS, Latency, Status).
 
 ## 🚀 Швидкий старт
 

@@ -209,6 +209,8 @@ routes:
 
 **`status`** — групується як `2xx`, `3xx`, `4xx`, `5xx` (не окремі коди, щоб уникнути cardinality explosion).
 
+> Детальніше: **[METRICS_REFERENCE.md](./METRICS_REFERENCE.md)**
+
 ---
 
 ## 7. Graceful Shutdown

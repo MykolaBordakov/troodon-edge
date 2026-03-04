@@ -10,29 +10,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
-use prometheus::{
-    HistogramVec, IntCounterVec, Opts, register_histogram_vec, register_int_counter_vec,
-};
-
-static REQ_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec!(
-        Opts::new(
-            "troodon_http_requests_total",
-            "Total number of HTTP requests"
-        ),
-        &["method", "status", "host"]
-    )
-    .expect("Failed to create metric REQ_COUNTER")
-});
-
-static REQ_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec!(
-        "troodon_http_request_duration_seconds",
-        "HTTP request duration in seconds",
-        &["method", "status", "host"]
-    )
-    .expect("Failed to create metric REQ_DURATION")
-});
+use crate::metrics::{REQ_COUNTER, REQ_DURATION};
 
 use crate::config::ServerConfig;
 

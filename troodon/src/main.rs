@@ -1,5 +1,6 @@
 mod background;
 mod config;
+mod metrics;
 mod proxy;
 mod router;
 

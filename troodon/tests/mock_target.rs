@@ -1,4 +1,4 @@
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -19,8 +19,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (mut socket, _) = listener.accept().await?;
         tokio::spawn(async move {
-            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-            let _ = socket.write_all(response.as_bytes()).await;
+            let mut buf = [0; 1024];
+            // Тримаємо з'єднання відкритим у циклі!
+            while let Ok(n) = socket.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                } // Троодон закрив з'єднання
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
         });
     }
 }

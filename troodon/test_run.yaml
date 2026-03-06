@@ -6,5 +6,7 @@ routes:
   - host: "localhost"
     locations:
       - path: "/"
-        upstreams: ["127.0.0.1:8081"]
+        upstreams:
+          - "127.0.0.1:8081"
+          - "127.0.0.1:8082"
         exact_match: false

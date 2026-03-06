@@ -80,6 +80,13 @@ impl PartialEq for Timeouts {
 pub struct RouteTlsConfig {
     pub cert: String,
     pub key: String,
+    // Вмикає або вимикає HTTP/2 на вхід (додає ALPN h2 в сертифікат)
+    #[serde(default = "default_true")]
+    pub http2: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // --- ROUTES ---
@@ -138,6 +145,10 @@ pub struct Location {
     // Окремий Host заголовок для upstream (якщо відрізняється від SNI).
     // Якщо None — використовується route.host (SNI) як Host заголовок.
     pub host_header: Option<String>,
+
+    // Чи використовувати HTTP/2 для підключення до бекенду
+    #[serde(default)]
+    pub upstream_http2: bool,
 }
 
 fn default_host_path() -> String {

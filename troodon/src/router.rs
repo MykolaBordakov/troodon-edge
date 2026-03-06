@@ -74,6 +74,7 @@ pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
                 upstream_tls: loc.upstream_tls,
                 websocket: loc.websocket,
                 client_max_body_size: loc.client_max_body_size,
+                upstream_http2: loc.upstream_http2,
             });
 
             let path = loc.path.clone();

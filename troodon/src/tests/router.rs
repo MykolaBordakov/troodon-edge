@@ -31,6 +31,7 @@ fn mock_config() -> Config {
                     timeouts: None,
                     client_max_body_size: None,
                     host_header: None,
+                    upstream_http2: false,
                 },
                 Location {
                     path: "/exact".to_string(),
@@ -45,6 +46,7 @@ fn mock_config() -> Config {
                     timeouts: None,
                     client_max_body_size: None,
                     host_header: None,
+                    upstream_http2: false,
                 },
             ],
         }],

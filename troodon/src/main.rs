@@ -127,13 +127,13 @@ fn main() {
     // 7. HTTPS / TLS СЛУХАЧ — SNI-based multi-cert
     // Кожен route може мати свій сертифікат. Один порт — багато доменів через SNI.
     if let Some(tls_port) = conf.tls_port {
-        let tls_routes: Vec<(String, String, String)> = conf
+        let tls_routes: Vec<(String, String, String, bool)> = conf
             .routes
             .iter()
             .filter_map(|r| {
                 r.tls
                     .as_ref()
-                    .map(|t| (r.host.clone(), t.cert.clone(), t.key.clone()))
+                    .map(|t| (r.host.clone(), t.cert.clone(), t.key.clone(), t.http2))
             })
             .collect();
 
@@ -144,7 +144,7 @@ fn main() {
             );
         } else {
             let tls_addr = format!("{}:{}", server_config.listen_addr, tls_port);
-            let (first_host, first_cert, first_key) = &tls_routes[0];
+            let (first_host, first_cert, first_key, _) = &tls_routes[0];
 
             match TlsSettings::intermediate(first_cert, first_key) {
                 Err(e) => {
@@ -159,11 +159,15 @@ fn main() {
                     let mut sni_map: HashMap<String, Arc<openssl::ssl::SslContext>> =
                         HashMap::new();
 
-                    for (host, cert, key) in &tls_routes {
+                    for (host, cert, key, http2_enabled) in &tls_routes {
                         let ctx_result = (|| -> anyhow::Result<openssl::ssl::SslContext> {
                             let mut b = SslContextBuilder::new(SslMethod::tls_server())?;
                             b.set_certificate_chain_file(cert)?;
                             b.set_private_key_file(key, SslFiletype::PEM)?;
+                            if *http2_enabled {
+                                // Дозволяємо HTTP/2 і HTTP/1.1 (h2, http/1.1)
+                                b.set_alpn_protos(b"\x02h2\x08http/1.1")?;
+                            }
                             Ok(b.build())
                         })();
 

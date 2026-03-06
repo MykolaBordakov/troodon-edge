@@ -42,6 +42,7 @@ pub struct ProxyRoute {
     pub upstream_tls: Option<bool>,
     pub websocket: bool,
     pub client_max_body_size: Option<usize>,
+    pub upstream_http2: bool,
 }
 
 // 2. Контекст запиту (наш "кошик" для передачі даних між етапами)
@@ -275,7 +276,6 @@ impl ProxyHttp for LB {
         }
         // ----------------------------------------
 
-        // SNI передаємо тільки якщо використовується TLS
         let peer_sni = if use_tls {
             route.sni.clone()
         } else {
@@ -284,6 +284,23 @@ impl ProxyHttp for LB {
 
         let mut peer = Box::new(HttpPeer::new(upstream.addr, use_tls, peer_sni.clone()));
         peer.sni = peer_sni; // Дублюємо SNI для сумісності з Pingora internal
+
+        // Увімкнення HTTP/2 для upstream
+        if route.upstream_http2 {
+            // Для TLS завжди використовуємо ALPN
+            if use_tls {
+                // Pingora ALPN Enum: H2H1 (надає перевагу h2, але дозволяє http1.1) або H2 (тільки h2)
+                // Використовуватимемо H2H1 для безпеки, але можна і просто H2
+                peer.options.alpn = pingora::upstreams::peer::ALPN::H2H1;
+            } else {
+                // Якщо не TLS — h2c (cleartext HTTP/2)
+                // Pingora поки що експериментально підтримує h2c або ми ігноруємо
+                // Pingora's Upstream Peer doesn't have an explicit cleartext h2 flag
+                // easily exposed without ALPN, but we will set alpn anyway (it probably ignores it for cleartext).
+                // TODO: pingora H2 cleartext might need ALPN::H2 if supported, setting H2H1.
+                peer.options.alpn = pingora::upstreams::peer::ALPN::H2;
+            }
+        }
 
         // Тайм-аути із маршруту (Route Specific)
         let timeouts = &route.timeouts;

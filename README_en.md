@@ -1,0 +1,56 @@
+# 🦖 Troodon Edge Proxy
+
+![Status](https://img.shields.io/badge/Status-Active%20Development-success)
+![Data Plane](https://img.shields.io/badge/Data%20Plane-Rust%20(Pingora)-orange)
+![Control Plane](https://img.shields.io/badge/Control%20Plane-Go-blue)
+
+**Troodon** is a high-performance Edge Proxy built in **Rust** (Pingora), designed for maximum speed, security, and flexibility. Architecture: Rust Data Plane + Go Control Plane + eBPF plugins (roadmap).
+
+## 🌟 Key Features
+
+- **Blazing Fast Data Plane:** Rust + [Pingora](https://github.com/cloudflare/pingora) (Cloudflare). Zero-copy streaming, 100% async.
+- **Radix Tree Routing:** O(k) routing via `matchit` — prefix and exact-match routes.
+- **Rock-Solid L7 Security:** Slowloris & OOM protection, true global connection limit enforcement (→ HTTP 429).
+- **Control-Plane Ready IP Access Control:** Ultra-fast `O(1)/O(log n)` two-level IP filtering (Global and Per-Route) based on a Radix Trie (`ipnet`). Explicit `whitelist` and `blacklist` with a customizable `default_action`.
+- **mTLS (Mutual TLS):** Client certificate verification at the domain level (`SslVerifyMode::PEER`). Includes fail-fast boot validation.
+- **Cascading Timeouts:** Timeout hierarchy server → location. Individual profiles for WebSocket (hours), REST (seconds), AI endpoints (minutes).
+- **Circuit Breaker:** Inflight-limit per backend via `pingora-limits` (→ HTTP 503).
+- **Active HTTP Health Checks:** Real HTTP checks (not just TCP) with configurable `health_check_path`. Background service runs testing every 5 seconds.
+- **WebSocket Support:** Automatic forwarding of `Upgrade`/`Connection` headers when `websocket: true`.
+- **HTTP/2 Support:** Full HTTP/2 capability for clients (downstream) via ALPN and for connecting to backends (`upstream_http2`).
+- **Multi-Domain TLS (SNI):** Per-route certificates. One HTTPS port serves N domains. Strict SNI checking: unknown or missing SNI → `TLS ALERT_FATAL`.
+- **Upstream TLS:** Explicit `upstream_tls` or port-based auto-detect. Full decoupling of SNI and Host headers via `host_header`.
+- **Hot Reload (SIGHUP):** Atomic routing table swapping with zero downtime via `ArcSwap`.
+- **Graceful Shutdown (SIGTERM):** 30s drain period, 60s force-close.
+- **Distributed Tracing:** Automatic `X-Request-Id` as `{epoch}-{counter}` — unique across instances and restarts.
+- **Prometheus Metrics:** `troodon_http_requests_total`, `troodon_http_request_duration_seconds`. HTTP statuses are grouped (`2xx/3xx/4xx/5xx`).
+- **Body Size Limiting:** True enforcement via `request_body_filter`, protecting against chunked encoding bypasses (→ HTTP 413).
+
+## 📚 Documentation
+
+- 🇺🇦 [README (Українська)](./README.md) | 🇬🇧 [README (English)](./README_en.md)
+- 🛡️ **[Config Reference (English)](./troodon/CONFIG_REFERENCE_en.md)** — all `config.yaml` parameters: IP filtering, L7 security, timeouts, WebSocket.
+- 🔒 **[TLS Reference (English)](./troodon/TLS_REFERENCE_en.md)** — downstream/upstream TLS and **mTLS** setup.
+
+## 🚀 Quick Start
+
+```bash
+cd troodon
+cargo run --release
+```
+
+For zero-downtime hot-reload:
+```bash
+kill -HUP $(pgrep troodon)
+```
+
+## 🏗️ Current Status
+
+| Component | Status | Details |
+|---|---|---|
+| **Data Plane (Rust)** | ✅ Stage 1 Complete | HTTP proxy, Radix routing, L7 security, **IP Filtering**, **HTTP/2**, Multi-domain SNI TLS, **mTLS**, WebSocket, Health Checks, Prometheus, Hot Reload, Graceful Shutdown |
+| **Control Plane (Go)** | 🔧 In Design | gRPC API for dynamic configuration updates |
+| **eBPF Plugins** | 📋 Roadmap | Kernel-level traffic filtering |
+
+---
+*Built with ❤️ for ultimate performance.*

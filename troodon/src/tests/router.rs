@@ -11,12 +11,14 @@ fn mock_config() -> Config {
             client_read_timeout: None,
             max_header_size: None,
             global_connections: None,
+            ip_access_control: None,
             prometheus_port: None,
         },
         tls_port: None,
         routes: vec![Route {
             host: "example.com".to_string(),
             tls: None,
+            ip_access_control: None,
             locations: vec![
                 Location {
                     path: "/api".to_string(),

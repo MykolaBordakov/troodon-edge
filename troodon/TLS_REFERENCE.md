@@ -26,6 +26,7 @@ routes:
     tls:
       cert: "/etc/ssl/certs/api.crt"    # PEM Full Chain
       key:  "/etc/ssl/private/api.key"  # PEM Private Key (без паролю)
+      http2: true                       # Увімкнути HTTP/2 через ALPN
     locations:
       - path: "/api"
         upstreams: ["backend:8080"]
@@ -51,6 +52,25 @@ routes:
 
 - **`cert`**: `.crt`/`.pem` з `-----BEGIN CERTIFICATE-----`. Рекомендується Full Chain (домен + проміжний CA).
 - **`key`**: `.key`/`.pem` з `-----BEGIN PRIVATE KEY-----`. Пароль на ключі **не підтримується**.
+- **`client_ca`** (тільки при `mtls.enabled: true`): файл CA, який використовувався для підпису сертифікатів клієнтів.
+
+### mTLS (Mutual TLS: перевірка клієнта)
+
+Якщо вам потрібно автентифікувати клієнтів криптографічно, ви можете вказати блок `mtls` усередині конфігу `tls`.
+
+```yaml
+    tls:
+      cert: "/etc/ssl/certs/admin.crt"
+      key:  "/etc/ssl/private/admin.key"
+      mtls:
+        enabled: true
+        client_ca: "/etc/ssl/certs/my_company_client_ca.crt"
+```
+
+Коли `mtls.enabled: true`:
+- Сервер вимагатиме сертифікат від клієнта під час хендшейку (відбуватиметься повноцінна взаємна TLS-перевірка).
+- Клієнтська сторона буде скинута (`TLS ALERT`), якщо сертифікат не був наданий або якщо він підписаний не тим `client_ca`, який налаштовано.
+- **Fail Fast:** Якщо ви увімкнули mTLS, але файл `client_ca` відсутній на диску, Troodon **не запуститься**, щоб не допустити випадкового зниження безпеки.
 
 ### SNI — строга перевірка
 

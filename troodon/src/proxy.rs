@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::metrics::{REQ_COUNTER, REQ_DURATION};
 
 use crate::config::ServerConfig;
+use crate::security::IpFilter;
 
 // Лічильник для генерації унікальних Request ID (без зовнішніх залежностей)
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -43,6 +44,7 @@ pub struct ProxyRoute {
     pub websocket: bool,
     pub client_max_body_size: Option<usize>,
     pub upstream_http2: bool,
+    pub ip_filter: Option<Arc<IpFilter>>,
 }
 
 // 2. Контекст запиту (наш "кошик" для передачі даних між етапами)
@@ -78,6 +80,7 @@ pub struct LB {
     pub router: Arc<ArcSwap<ProxyRouter>>,
     pub config: Arc<ServerConfig>,
     pub inflight: Arc<pingora_limits::inflight::Inflight>,
+    pub global_ip_filter: Option<Arc<IpFilter>>,
 }
 
 #[async_trait]
@@ -103,13 +106,27 @@ impl ProxyHttp for LB {
         }
     }
 
-    // 0. ФІЛЬТР ЗАПИТУ (Рання валідація L7 Security)
+        // 0. ФІЛЬТР ЗАПИТУ (Рання валідація L7 Security)
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         // Генеруємо унікальний Request ID для кожного запиту.
         // Формат: <process_start_epoch_hex>-<counter_hex>.
         // process_start_epoch гарантує унікальність між рестартами та інстансами.
         let req_num = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         ctx.request_id = format!("{:08x}-{:016x}", *PROCESS_START_SECS, req_num);
+
+        // --- ГЛОБАЛЬНА IP ФІЛЬТРАЦІЯ ---
+        if let Some(ref filter) = self.global_ip_filter {
+            if let Some(client_ip) = session.client_addr() {
+                if let Some(inet) = client_ip.as_inet() {
+                    let ip = inet.ip();
+                    if !filter.is_allowed(&ip) {
+                        warn!("🛑 Global IP Filter blocked connection from {}. Returning 403. ReqID={}", ip, ctx.request_id);
+                        let _ = session.respond_error(403).await;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
 
         // #10: Enforce глобальний ліміт конекцій
         if let Some(max_conn) = self.config.global_connections {
@@ -190,6 +207,19 @@ impl ProxyHttp for LB {
         };
 
         debug!("Path '{}' matched route '{}'", path, route.path);
+
+        // --- ЛОКАЛЬНА IP ФІЛЬТРАЦІЯ (Per-Route) ---
+        if let Some(ref filter) = route.ip_filter {
+            if let Some(client_ip) = session.client_addr() {
+                if let Some(inet) = client_ip.as_inet() {
+                    let ip = inet.ip();
+                    if !filter.is_allowed(&ip) {
+                        warn!("🛑 Route IP Filter blocked connection from {} for '{}'. Returning 403. ReqID={}", ip, route.path, ctx.request_id);
+                        return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(403)));
+                    }
+                }
+            }
+        }
 
         // === МАГІЯ ТУТ ===
         // Зберігаємо знайдений SNI в контекст, щоб використати пізніше

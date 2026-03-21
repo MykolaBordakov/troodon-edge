@@ -29,6 +29,9 @@ pub struct ServerConfig {
     pub max_header_size: Option<usize>,
     pub global_connections: Option<usize>,
 
+    // Глобальна IP-фільтрація
+    pub ip_access_control: Option<IpAccessControl>,
+
     // Порт для експорту метрик Prometheus (опціонально)
     pub prometheus_port: Option<u16>,
 }
@@ -75,6 +78,24 @@ impl PartialEq for Timeouts {
     }
 }
 
+// --- IP ACCESS CONTROL ---
+#[derive(Debug, Deserialize, Clone)]
+pub struct IpAccessControl {
+    pub enabled: bool,
+    pub default_action: String, // "allow" або "deny"
+    #[serde(default)]
+    pub whitelist: Vec<String>,
+    #[serde(default)]
+    pub blacklist: Vec<String>,
+}
+
+// --- MTLS CONFIG ---
+#[derive(Debug, Deserialize, Clone)]
+pub struct MtlsConfig {
+    pub enabled: bool,
+    pub client_ca: Option<String>,
+}
+
 // --- PER-ROUTE TLS ---
 #[derive(Debug, Deserialize)]
 pub struct RouteTlsConfig {
@@ -83,6 +104,8 @@ pub struct RouteTlsConfig {
     // Вмикає або вимикає HTTP/2 на вхід (додає ALPN h2 в сертифікат)
     #[serde(default = "default_true")]
     pub http2: bool,
+    // Налаштування mTLS для цього маршруту
+    pub mtls: Option<MtlsConfig>,
 }
 
 fn default_true() -> bool {
@@ -99,6 +122,9 @@ pub struct Route {
     // Якщо задано — цей маршрут обслуговується через HTTPS (сертифікат per-domain).
     // Якщо None — тільки HTTP.
     pub tls: Option<RouteTlsConfig>,
+
+    // Локальна IP-фільтрація (per-route)
+    pub ip_access_control: Option<IpAccessControl>,
 
     pub locations: Vec<Location>,
 }

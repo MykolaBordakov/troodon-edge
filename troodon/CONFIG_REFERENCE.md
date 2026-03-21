@@ -47,6 +47,21 @@ server:
     idle: 30      # [ВАЖЛИВО] Keep-Alive. Не ставити 0!
 ```
 
+### 1.3 Глобальна IP Фільтрація (`ip_access_control`)
+
+Працює для всіх запитів до серверу. Перевіряє IP-адресу клієнта ще до початку маршрутизації.
+
+```yaml
+server:
+  ip_access_control:
+    enabled: true
+    default_action: "allow" # Що робити, якщо IP немає в списках ("allow" / "deny")
+    blacklist:
+      - "192.168.1.100"     # Точний IP
+      - "10.0.0.0/8"        # Підмережа (CIDR)
+    whitelist: []           # Whitelist має вищий пріоритет за Blacklist
+```
+
 ---
 
 ## 2. TLS (HTTPS) — Per-Route, Multi-Domain
@@ -87,6 +102,15 @@ routes:
     tls:                       # Опціонально — per-route TLS
       cert: "..."
       key:  "..."
+      http2: true              # Відкривати ALPN h2 для клієнтів (за замовчуванням false)
+      mtls:                    # Опціонально — перевірка клієнтського сертифікату
+        enabled: true
+        client_ca: "client-ca.crt"
+    ip_access_control:         # Опціонально — IP фільтрація саме для цього домену
+      enabled: true
+      default_action: "deny"   # Блокуємо всіх
+      whitelist: ["127.0.0.1"] # Крім цих IP
+      blacklist: []
     locations:
       - path: "/api"
         ...
@@ -105,6 +129,7 @@ routes:
 | `retry_count` | `usize` | `0` | Кількість ретраїв при падінні бекенду |
 | `max_inflight` | `isize?` | `null` | Circuit Breaker: max in-flight → 503 |
 | `upstream_tls` | `bool?` | `null` | TLS до upstream. `null` = автодетект по порту 443 |
+| `upstream_http2`| `bool` | `false` | Увімкнути HTTP/2 з'єднання до бекенду |
 | `client_max_body_size` | `usize?` | `null` | Ліміт тіла запиту (байти) → 413 |
 | `host_header` | `string?` | `null` | Явний Host заголовок до upstream (якщо відрізняється від SNI) |
 | `timeouts` | `Timeouts?` | глобальні | Перекривають глобальні `server.timeouts` |
@@ -151,6 +176,14 @@ routes:
     tls:
       cert: "/etc/ssl/certs/api.crt"
       key:  "/etc/ssl/private/api.key"
+      mtls:
+        enabled: false
+        client_ca: "client-ca.crt"
+    ip_access_control:
+      enabled: false
+      default_action: "allow"
+      whitelist: []
+      blacklist: []
     locations:
 
       # REST API
@@ -158,6 +191,7 @@ routes:
         upstreams: ["127.0.0.1:8000"]
         health_check_path: "/health"
         retry_count: 2
+        upstream_http2: true
         client_max_body_size: 1048576  # 1 MB
 
       # AI endpoint з Circuit Breaker

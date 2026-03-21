@@ -4,6 +4,7 @@ use matchit::Router;
 use pingora::lb::LoadBalancer;
 use pingora::lb::health_check::HttpHealthCheck;
 use std::sync::Arc;
+use crate::security::IpFilter;
 use tracing::{error, info};
 
 pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
@@ -13,6 +14,9 @@ pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
 
     for route_conf in &conf.routes {
         let sni_host = route_conf.host.clone();
+        
+        // Ініціалізуємо фільтр для маршруту лише один раз
+        let route_ip_filter = route_conf.ip_access_control.as_ref().map(|c| Arc::new(IpFilter::new(c)));
 
         for loc in &route_conf.locations {
             if loc.upstreams.is_empty() {
@@ -75,6 +79,7 @@ pub fn build_router(conf: &config::Config) -> Option<ProxyRouter> {
                 websocket: loc.websocket,
                 client_max_body_size: loc.client_max_body_size,
                 upstream_http2: loc.upstream_http2,
+                ip_filter: route_ip_filter.clone(),
             });
 
             let path = loc.path.clone();

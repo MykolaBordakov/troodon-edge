@@ -38,6 +38,7 @@ pingora-limits = "0.8.0"
 prometheus = { version = "0.13", default-features = false }
 bytes = "1.11.1"
 openssl = { version = "0.10.75", features = ["v102", "v110"] }
+ipnet = "2.12.0"
 
 [dev-dependencies]
 reqwest = "0.12"

@@ -10,6 +10,15 @@ server:
   max_header_size: 8192 # Bytes (Max Header Size, OOM protection)
   global_connections: 50000 # Global Concurrency Limit
 
+  # Глобальна IP-фільтрація (захист всього сервера від ботнетів)
+  ip_access_control:
+    enabled: true
+    default_action: "allow"
+    blacklist:
+      - "192.168.1.100"
+      - "10.0.0.0/8"
+    whitelist: []
+
 # Порт для HTTPS. Один порт — багато доменів через SNI.
 # Кожен route з блоком `tls:` обслуговується на цьому порту зі своїм сертифікатом.
 # Якщо не задано — HTTPS вимкнено.
@@ -21,6 +30,9 @@ routes:
     tls:
       cert: "test.crt"
       key: "test.key"
+      mtls:
+        enabled: false # Змінити на true, щоб вимагати клієнтський сертифікат
+        client_ca: "client-ca.crt" # Обов'язковий файл, якщо enabled: true
     locations:
       - path: "/api"
         upstreams: ["1.1.1.1:443"]
@@ -33,6 +45,16 @@ routes:
     tls:
       cert: "test.crt" # У реальному середовищі — окремий сертифікат
       key: "test.key"
+    
+    # Локальна IP-фільтрація (сценарій: закрити все, залишити вайт-ліст)
+    ip_access_control:
+      enabled: true
+      default_action: "deny"
+      whitelist:
+        - "127.0.0.1"
+        - "192.168.0.0/16" 
+      blacklist: []
+
     locations:
       - path: "/"
         upstreams: ["127.0.0.1:8000"]

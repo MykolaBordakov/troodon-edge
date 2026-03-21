@@ -1,0 +1,12 @@
+server:
+  listen_addr: "127.0.0.1"
+  listen_port: 18001
+  log_level: "debug"
+routes:
+  - host: "localhost"
+    locations:
+      - path: "/"
+        upstreams:
+          - "127.0.0.1:8081"
+          - "127.0.0.1:8082"
+        exact_match: false

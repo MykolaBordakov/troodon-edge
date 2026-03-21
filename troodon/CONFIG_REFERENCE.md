@@ -11,6 +11,7 @@ server:
   listen_addr: "0.0.0.0"   # IP для прослуховування
   listen_port: 6188         # HTTP порт
   prometheus_port: 9090     # Порт для Prometheus метрик (опціонально)
+  prometheus_listen_addr: "127.0.0.1" # IP для Prometheus (дефолт: 127.0.0.1)
   log_level: "info"         # Рівень логів: trace | debug | info | warn | error
 ```
 
@@ -131,6 +132,7 @@ routes:
 | `upstream_tls` | `bool?` | `null` | TLS до upstream. `null` = автодетект по порту 443 |
 | `upstream_http2`| `bool` | `false` | Увімкнути HTTP/2 з'єднання до бекенду |
 | `client_max_body_size` | `usize?` | `null` | Ліміт тіла запиту (байти) → 413 |
+| `req_per_sec` | `isize?` | `null` | Rate Limit: макс. кількість запитів на секунду з одного IP |
 | `host_header` | `string?` | `null` | Явний Host заголовок до upstream (якщо відрізняється від SNI) |
 | `timeouts` | `Timeouts?` | глобальні | Перекривають глобальні `server.timeouts` |
 
@@ -168,6 +170,11 @@ server:
     write: 10
     idle: 30
 
+### 4.1 Автоматичні Security Headers
+Troodon автоматично додає наступні заголовки до всіх відповідей від upstream для підвищення безпеки:
+- `Strict-Transport-Security`: `max-age=31536000; includeSubDomains; preload` (якщо TLS увімкнено)
+- `X-Content-Type-Options`: `nosniff`
+- `X-Frame-Options`: `DENY`
 # HTTPS порт (top-level, не в server:)
 tls_port: 6443
 
@@ -193,6 +200,7 @@ routes:
         retry_count: 2
         upstream_http2: true
         client_max_body_size: 1048576  # 1 MB
+        req_per_sec: 10               # Макс 10 запитів/сек з одного IP
 
       # AI endpoint з Circuit Breaker
       - path: "/ai-generate"
@@ -227,7 +235,7 @@ routes:
 
 ## 5. Distributed Tracing (X-Request-Id)
 
-Кожен запит автоматично отримує `X-Request-Id` у форматі `{epoch_hex}-{counter_hex}`. Унікальний між рестартами та інстансами (без UUID залежності).
+Кожен запит автоматично отримує `X-Request-Id` у форматі `{random_hex}-{counter_hex}`. Гарантована унікальність між рестартами та інстансами.
 
 - **Ін'єктується** в upstream запит як `X-Request-Id`
 - **Логується** в access log: `ReqID=67c5ee80-000000000000002f`

@@ -11,6 +11,7 @@ server:
   listen_addr: "0.0.0.0"   # IP to listen on
   listen_port: 6188         # HTTP port
   prometheus_port: 9090     # Prometheus metrics port (optional)
+  prometheus_listen_addr: "127.0.0.1" # IP for Prometheus (default: 127.0.0.1)
   log_level: "info"         # Log level: trace | debug | info | warn | error
 ```
 
@@ -131,6 +132,7 @@ routes:
 | `upstream_tls` | `bool?` | `null` | TLS connection to upstream. `null` = auto-detect via port 443 |
 | `upstream_http2`| `bool` | `false` | Enable HTTP/2 connections to the backend |
 | `client_max_body_size` | `usize?` | `null` | Max request body limit (bytes) → 413 |
+| `req_per_sec` | `isize?` | `null` | Rate Limit: max requests per second from a single IP |
 | `host_header` | `string?` | `null` | Explicit Host header to upstream (if different from SNI) |
 | `timeouts` | `Timeouts?` | global | Overrides the global `server.timeouts` |
 
@@ -173,6 +175,11 @@ server:
     write: 10
     idle: 30
 
+### 4.1 Automatic Security Headers
+Troodon automatically injects the following headers to all upstream responses for enhanced security:
+- `Strict-Transport-Security`: `max-age=31536000; includeSubDomains; preload` (if TLS is enabled)
+- `X-Content-Type-Options`: `nosniff`
+- `X-Frame-Options`: `DENY`
 # HTTPS port (top-level, not in server:)
 tls_port: 6443
 
@@ -198,6 +205,7 @@ routes:
         retry_count: 2
         upstream_http2: true
         client_max_body_size: 1048576  # 1 MB
+        req_per_sec: 10               # Max 10 req/sec per IP
 
       # AI endpoint with Circuit Breaker
       - path: "/ai-generate"
@@ -232,7 +240,7 @@ routes:
 
 ## 5. Distributed Tracing (X-Request-Id)
 
-Every request is automatically assigned an `X-Request-Id` in the format `{epoch_hex}-{counter_hex}`. This is uniquely guaranteed between restarts and instances (without the heavy UUID dependencies).
+Every request is automatically assigned an `X-Request-Id` in the format `{random_hex}-{counter_hex}`. Guaranteed uniqueness across restarts and instances.
 
 - **Injected** into upstream requests as the `X-Request-Id` header.
 - **Logged** in the access logs: `ReqID=67c5ee80-000000000000002f`

@@ -13,10 +13,11 @@ server:
   listen_addr: "0.0.0.0"
   listen_port: 80
   prometheus_port: 9090  # <--- Enables metrics export on port 9090
+  prometheus_listen_addr: "127.0.0.1" # Optional: binding IP (default: 127.0.0.1)
   log_level: "info"
 ```
 
-When the proxy starts with this parameter, the server binds an additional TCP listener exclusively for Prometheus metrics. By default, it listens on the same `listen_addr` as the main server (in this example `0.0.0.0:9090`).
+When the proxy starts with this parameter, the server binds an additional TCP listener exclusively for Prometheus metrics. **Important:** By default, it listens on `127.0.0.1` only to ensure security (metrics isolation). If you need to expose it externally, change `prometheus_listen_addr` to `0.0.0.0`.
 
 In your Prometheus configuration (`scrape_configs`), simply add this port for collection:
 ```yaml

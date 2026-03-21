@@ -345,6 +345,7 @@ impl ProxyHttp for LB {
                     "🛑 Request body too large via Content-Length ({} > {} bytes). Returning 413. ReqID={}",
                     content_length, max_body, ctx.request_id
                 );
+                session.set_keepalive(None);
                 return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(413)));
             }
         }
@@ -540,6 +541,7 @@ impl ProxyHttp for LB {
                     );
                     // Дропаємо chunk і повертаємо помилку
                     *body = None;
+                    _session.set_keepalive(None);
                     return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(413)));
                 }
             }

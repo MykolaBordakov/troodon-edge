@@ -5,3 +5,6 @@ mod config;
 
 #[cfg(test)]
 mod router;
+
+#[cfg(test)]
+mod security;

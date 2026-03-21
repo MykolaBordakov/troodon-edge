@@ -5,9 +5,10 @@ use pingora::lb::LoadBalancer;
 use pingora::lb::selection::RoundRobin;
 use pingora::prelude::*;
 use pingora::upstreams::peer::Peer;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::metrics::{REQ_COUNTER, REQ_DURATION};
@@ -20,22 +21,47 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // Час старту процесу у секундах від Unix Epoch — префікс для Request ID.
 // Гарантує унікальність між рестартами/інстансами (без UUID залежності).
-static PROCESS_START_SECS: LazyLock<u64> = LazyLock::new(|| {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-});
+
+// === ХЕЛПЕР: Витягти IP клієнта (IPv4 або IPv6) ===
+// Pingora's SocketAddr має as_inet() → Option<&std::net::SocketAddrV4> для IPv4.
+// Для IPv6 немає окремого методу — використовуємо to_string() і парсимо IpAddr.
+// Це дозволяє коректно обробляти як IPv4 так і IPv6 підключення.
+fn extract_client_ip(
+    client_addr: Option<&pingora::protocols::l4::socket::SocketAddr>,
+) -> Option<std::net::IpAddr> {
+    use std::net::IpAddr;
+    client_addr.and_then(|sa| {
+        // Fast path: IPv4 via Pingora's native as_inet()
+        if let Some(v4) = sa.as_inet() {
+            return Some(v4.ip());
+        }
+        // Fallback: parse from string representation (handles IPv6, Unix sockets)
+        // Format from Pingora: "ip:port" — split at last ':' to strip port
+        let s = sa.to_string();
+        // IPv6 addresses in socket strings are like "[::1]:port" — try stripping brackets
+        let s = s.trim_start_matches('[');
+        if let Some(bracket_end) = s.find("]:") {
+            // IPv6: "[::1]:1234" → "::1"
+            s[..bracket_end].parse::<IpAddr>().ok()
+        } else {
+            // IPv4-like or hostname:port → split at last colon
+            let ip_part = s.rsplitn(2, ':').nth(1).unwrap_or(s);
+            ip_part.parse::<IpAddr>().ok()
+        }
+    })
+}
 
 // === СТРУКТУРИ ===
 
 // 1. Опис маршруту (те, що ми підготували в main.rs)
 pub struct ProxyRoute {
-    pub path: String,
+    pub path: Arc<str>,
     pub lb: Arc<LoadBalancer<RoundRobin>>,
-    pub sni: String,
+    pub sni: Arc<str>,
     // Явний Host заголовок для upstream. Якщо None — використовується sni.
-    pub host_header: Option<String>,
+    pub host_header: Option<Arc<str>>,
+    pub health_check_path: Option<Arc<str>>,
+    pub rate_limit: Option<(Arc<pingora_limits::rate::Rate>, isize)>,
     pub strip_prefix: bool,
     pub max_inflight: Option<isize>,
     pub timeouts: crate::config::Timeouts,
@@ -49,11 +75,11 @@ pub struct ProxyRoute {
 
 // 2. Контекст запиту (наш "кошик" для передачі даних між етапами)
 pub struct ProxyContext {
-    pub sni: String,
+    pub sni: Arc<str>,
     // Значення, яке реально пишеться у заголовок Host upstream запиту
-    pub effective_host: String,
+    pub effective_host: Arc<str>,
     pub strip_prefix: bool,
-    pub path_prefix: String,
+    pub path_prefix: Arc<str>,
     pub inflight_guard: Option<pingora_limits::inflight::Guard>,
     pub start_time: Instant,
     pub retries_left: usize,
@@ -69,9 +95,11 @@ pub struct ProxyContext {
     pub max_body_size: Option<usize>,
 }
 
-// 3. Роутер, який містить Radix-дерево
+// 3. Роутер, який містить Radix-дерева, індексовані по hostname.
+// Ключ — значення Host заголовка (наприклад "api.example.com").
+// Маршрутизація: Host → per-host Router → path lookup.
 pub struct ProxyRouter {
-    pub routes: Router<Arc<ProxyRoute>>,
+    pub routes: HashMap<String, Router<Arc<ProxyRoute>>>,
     pub health_checks: Vec<(String, Arc<LoadBalancer<RoundRobin>>)>,
 }
 
@@ -91,10 +119,10 @@ impl ProxyHttp for LB {
     // Ініціалізуємо контекст порожнім
     fn new_ctx(&self) -> Self::CTX {
         ProxyContext {
-            sni: String::new(),
-            effective_host: String::new(),
+            sni: "".into(),
+            effective_host: "".into(),
             strip_prefix: false,
-            path_prefix: String::new(),
+            path_prefix: "".into(),
             inflight_guard: None,
             start_time: Instant::now(),
             retries_left: 0,
@@ -106,24 +134,24 @@ impl ProxyHttp for LB {
         }
     }
 
-        // 0. ФІЛЬТР ЗАПИТУ (Рання валідація L7 Security)
+    // 0. ФІЛЬТР ЗАПИТУ (Рання валідація L7 Security)
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         // Генеруємо унікальний Request ID для кожного запиту.
         // Формат: <process_start_epoch_hex>-<counter_hex>.
         // process_start_epoch гарантує унікальність між рестартами та інстансами.
-        let req_num = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        ctx.request_id = format!("{:08x}-{:016x}", *PROCESS_START_SECS, req_num);
+        let req_num = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        ctx.request_id = format!("{:016x}-{:016x}", fastrand::u64(..), req_num);
 
         // --- ГЛОБАЛЬНА IP ФІЛЬТРАЦІЯ ---
         if let Some(ref filter) = self.global_ip_filter {
-            if let Some(client_ip) = session.client_addr() {
-                if let Some(inet) = client_ip.as_inet() {
-                    let ip = inet.ip();
-                    if !filter.is_allowed(&ip) {
-                        warn!("🛑 Global IP Filter blocked connection from {}. Returning 403. ReqID={}", ip, ctx.request_id);
-                        let _ = session.respond_error(403).await;
-                        return Ok(true);
-                    }
+            if let Some(ip) = extract_client_ip(session.client_addr()) {
+                if !filter.is_allowed(&ip) {
+                    warn!(
+                        "🛑 Global IP Filter blocked connection from {}. Returning 403. ReqID={}",
+                        ip, ctx.request_id
+                    );
+                    let _ = session.respond_error(403).await;
+                    return Ok(true);
                 }
             }
         }
@@ -132,7 +160,7 @@ impl ProxyHttp for LB {
         if let Some(max_conn) = self.config.global_connections {
             let (guard, current) = self.inflight.incr("::global".to_string(), 1);
             if current > max_conn as isize {
-                drop(guard); // ҉о не зберігаємо guard, лічильник відразу decr
+                drop(guard); // не зберігаємо guard, лічильник відразу decr
                 warn!(
                     "🛑 Global connection limit exceeded ({}/{} active). Returning 429. ReqID={}",
                     current, max_conn, ctx.request_id
@@ -180,43 +208,72 @@ impl ProxyHttp for LB {
     async fn upstream_peer(
         &self,
         session: &mut Session,
-        ctx: &mut Self::CTX, // Отримуємо доступ до контексту
+        ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        // Зберігаємо час початку запиту в context (використовуємо pingora context cache замість кастомних полів, або додамо поле в ProxyContext)
-        // Для простоти, додаватимемо поле `start_time` у ProxyContext.
-
         let path = session.req_header().uri.path();
+
+        // --- HOST-BASED ROUTING ---
+        // Крок 1: визначаємо hostname запиту.
+        // Пріоритет: :authority (HTTP/2) > Host header > URI authority.
+        // Відрізаємо порт якщо є ("api.example.com:443" → "api.example.com").
+        let host = session
+            .req_header()
+            .uri
+            .authority()
+            .map(|a| a.host().to_string())
+            .or_else(|| {
+                session
+                    .req_header()
+                    .headers
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|h| h.split(':').next().unwrap_or(h).to_string())
+            })
+            .unwrap_or_default();
 
         // Атомарно читаємо поточний роутер
         let router_guard = self.router.load();
 
-        debug!("🔍 Routing path: '{}'", path);
+        debug!("🔍 Routing: host='{}' path='{}'", host, path);
 
-        // Шукаємо маршрут через Radix-дерево (O(k), де k - довжина шляху)
-        let route = match router_guard.routes.at(path) {
+        // Крок 2: знаходимо per-host router
+        let host_router = match router_guard.routes.get(&host) {
+            Some(r) => r,
+            None => {
+                warn!(
+                    "No routes configured for host '{}'. Returning 404. ReqID={}",
+                    host, ctx.request_id
+                );
+                return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)));
+            }
+        };
+
+        // Крок 3: шукаємо маршрут через Radix-дерево (O(k), де k — довжина шляху)
+        let route = match host_router.at(path) {
             Ok(found) => {
-                debug!("✅ Matchit found match for path: '{}'", path);
+                debug!("✅ Matched route for host='{}' path='{}'", host, path);
                 found.value
             }
-            Err(e) => {
-                error!("❌ Matchit rejected path '{}' with error: {:?}", path, e); // NEW DEBUG LOG
-                warn!("No route found for path: {}", path);
-                // Повертаємо 404, якщо маршрут не знайдено
+            Err(_) => {
+                warn!(
+                    "No route found for host='{}' path='{}'. Returning 404. ReqID={}",
+                    host, path, ctx.request_id
+                );
                 return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)));
             }
         };
 
         debug!("Path '{}' matched route '{}'", path, route.path);
 
-        // --- ЛОКАЛЬНА IP ФІЛЬТРАЦІЯ (Per-Route) ---
+        // --- ЛОКАЛЬНА IP ФІЛЬТРАЦІЯ (Per-Route) — підтримує IPv4 та IPv6 ---
         if let Some(ref filter) = route.ip_filter {
-            if let Some(client_ip) = session.client_addr() {
-                if let Some(inet) = client_ip.as_inet() {
-                    let ip = inet.ip();
-                    if !filter.is_allowed(&ip) {
-                        warn!("🛑 Route IP Filter blocked connection from {} for '{}'. Returning 403. ReqID={}", ip, route.path, ctx.request_id);
-                        return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(403)));
-                    }
+            if let Some(ip) = extract_client_ip(session.client_addr()) {
+                if !filter.is_allowed(&ip) {
+                    warn!(
+                        "🛑 Route IP Filter blocked {} for '{}'. Returning 403. ReqID={}",
+                        ip, route.path, ctx.request_id
+                    );
+                    return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(403)));
                 }
             }
         }
@@ -246,6 +303,23 @@ impl ProxyHttp for LB {
             "Load Balancer selected upstream: {:?}",
             upstream.addr.as_inet()
         );
+
+        if let Some((rate_tracker, max_rps)) = &route.rate_limit {
+            if let Some(ip) = extract_client_ip(session.client_addr()) {
+                let observed = rate_tracker.observe(&ip.to_string(), 1);
+                if observed > *max_rps {
+                    warn!(
+                        "Rate limit exceeded for IP {} ({} > {}) -> 429",
+                        ip, observed, max_rps
+                    );
+                    let mut resp = pingora::http::ResponseHeader::build(429, None).unwrap();
+                    resp.insert_header("Retry-After", "1").unwrap();
+                    session.set_keepalive(None);
+                    let _ = session.write_response_header(Box::new(resp), true).await;
+                    return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(429)));
+                }
+            }
+        }
 
         // Зберігаємо WebSocket прапорець в контекст
         ctx.websocket = route.websocket;
@@ -307,7 +381,7 @@ impl ProxyHttp for LB {
         // ----------------------------------------
 
         let peer_sni = if use_tls {
-            route.sni.clone()
+            route.sni.to_string()
         } else {
             String::new()
         };
@@ -352,7 +426,7 @@ impl ProxyHttp for LB {
         // --- PRODUCTION HEADERS ---
         // Використовуємо effective_host (може відрізнятись від SNI через host_header в конфігу)
         if !ctx.effective_host.is_empty() {
-            upstream_request.insert_header("Host", &ctx.effective_host)?;
+            upstream_request.insert_header("Host", ctx.effective_host.as_ref())?;
         } else {
             // Якщо обидва порожні — щось пішло не так. Логуємо і не надсилаємо Host,
             // що призведе до 400 на upstream. Це краще ніж тихо надсилати неправильний Host.
@@ -363,34 +437,52 @@ impl ProxyHttp for LB {
         }
 
         // X-Real-IP / X-Forwarded-For
-        if let Some(client_ip) = session.client_addr()
-            && let Some(ip) = client_ip.as_inet()
-        {
-            let ip_str = ip.ip().to_string();
+        // X-Forwarded-For ДОПОВНЮЄТЬСЯ (append), а не замінюється — RFC 7239.
+        // Це критично для multi-tier proxy (CDN → Troodon → backend).
+        if let Some(ip) = extract_client_ip(session.client_addr()) {
+            let ip_str = ip.to_string();
             upstream_request.insert_header("X-Real-IP", &ip_str)?;
-            upstream_request.insert_header("X-Forwarded-For", &ip_str)?;
+
+            // Читаємо існуючий XFF (від попереднього проксі, якщо є)
+            let new_xff = match session.req_header().headers.get("x-forwarded-for") {
+                Some(existing) => {
+                    // Append: "existing_ips, client_ip"
+                    let existing_str = existing.to_str().unwrap_or("");
+                    format!("{}, {}", existing_str, ip_str)
+                }
+                None => ip_str,
+            };
+            upstream_request.insert_header("X-Forwarded-For", &new_xff)?;
         }
 
         // #15: X-Request-Id для distributed tracing
         upstream_request.insert_header("X-Request-Id", &ctx.request_id)?;
-        upstream_request.insert_header("X-Proxy", "Troodon/0.1.0")?;
+        upstream_request
+            .insert_header("X-Proxy", concat!("Troodon/", env!("CARGO_PKG_VERSION")))?;
 
         // #11: Для WebSocket передаємо hop-by-hop заголовки Upgrade/Connection
         if ctx.websocket {
-            if let Some(upg_val) = session.req_header().headers.get("upgrade").cloned() {
-                upstream_request.insert_header("Upgrade", upg_val)?;
+            if let Some(upg_val) = session.req_header().headers.get("upgrade") {
+                if upg_val.as_bytes().eq_ignore_ascii_case(b"websocket") {
+                    upstream_request.insert_header("Upgrade", "websocket")?;
+                    upstream_request.insert_header("Connection", "Upgrade")?;
+                    debug!(
+                        "WebSocket upgrade headers forwarded. ReqID={}",
+                        ctx.request_id
+                    );
+                } else {
+                    warn!(
+                        "Invalid Upgrade header value for websocket route: {:?}",
+                        upg_val
+                    );
+                }
             }
-            upstream_request.insert_header("Connection", "Upgrade")?;
-            debug!(
-                "WebSocket upgrade headers forwarded. ReqID={}",
-                ctx.request_id
-            );
         }
 
         // Логіка strip_prefix: якщо увімкнена, обрізаємо шлях
-        if ctx.strip_prefix && !ctx.path_prefix.is_empty() && ctx.path_prefix != "/" {
+        if ctx.strip_prefix && !ctx.path_prefix.is_empty() && ctx.path_prefix.as_ref() != "/" {
             let original_path = session.req_header().uri.path();
-            if let Some(stripped) = original_path.strip_prefix(&ctx.path_prefix) {
+            if let Some(stripped) = original_path.strip_prefix(ctx.path_prefix.as_ref()) {
                 // Запобігаємо порожньому шляху
                 let new_path = if stripped.is_empty() { "/" } else { stripped };
 
@@ -497,7 +589,17 @@ impl ProxyHttp for LB {
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
         // Додаємо заголовок, щоб показати, що відповідь пройшла через наш проксі
-        upstream_response.insert_header("X-Proxy-By", "Troodon/0.1.0")?;
+        upstream_response
+            .insert_header("X-Proxy-By", concat!("Troodon/", env!("CARGO_PKG_VERSION")))?;
+
+        // Додаємо базові Security Headers
+        upstream_response.insert_header(
+            "Strict-Transport-Security",
+            "max-age=63072000; includeSubDomains; preload",
+        )?;
+        upstream_response.insert_header("X-Content-Type-Options", "nosniff")?;
+        upstream_response.insert_header("X-Frame-Options", "DENY")?;
+
         Ok(())
     }
 
@@ -527,9 +629,9 @@ impl ProxyHttp for LB {
 
         // Host header: використовуємо effective_host, fallback до SNI
         let host_str = if !ctx.effective_host.is_empty() {
-            ctx.effective_host.as_str()
+            ctx.effective_host.as_ref()
         } else if !ctx.sni.is_empty() {
-            ctx.sni.as_str()
+            ctx.sni.as_ref()
         } else {
             "unknown"
         };

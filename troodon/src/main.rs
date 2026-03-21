@@ -19,7 +19,6 @@ use proxy::LB;
 use router::build_router;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 
 fn main() {
@@ -27,7 +26,9 @@ fn main() {
     let conf = match config::load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("🔥 Fatal error loading config {}: {}", config_path, e);
+            // Init minimal logger to record fatal error in production format
+            tracing_subscriber::fmt().json().with_env_filter("info").init();
+            tracing::error!("🔥 Fatal error loading config {}: {}", config_path, e);
             std::process::exit(1);
         }
     };
@@ -80,32 +81,27 @@ fn main() {
     let hot_reload_config_path = config_path.clone();
     std::thread::spawn(move || {
         let config_path = hot_reload_config_path;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build hot-reload Tokio runtime");
-        rt.block_on(async {
-            let mut sig = signal(SignalKind::hangup()).expect("Failed to bind SIGHUP");
-            loop {
-                sig.recv().await;
-                info!("🔄 Received SIGHUP! Reloading config...");
-                warn!("⚠️  Hot reload updates routing table ONLY. Server config changes require a full restart.");
+        let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGHUP])
+            .expect("Failed to create signals iterator");
 
-                match config::load_config(&config_path) {
-                    Ok(new_conf) => {
-                        if let Some(new_router) = build_router(&new_conf) {
-                            hot_reload_router.store(Arc::new(new_router));
-                            info!("✅ Hot reload successful! Routing table updated atomically.");
-                        } else {
-                            warn!("⚠️ New config has no valid routes. Keeping old routing table.");
-                        }
-                    }
-                    Err(e) => {
-                        error!("❌ Failed to parse new config during hot reload: {}", e);
+        for _sig in signals.forever() {
+            info!("🔄 Received SIGHUP! Reloading config...");
+            warn!("⚠️  Hot reload updates routing table ONLY. Server config changes require a full restart.");
+
+            match config::load_config(&config_path) {
+                Ok(new_conf) => {
+                    if let Some(new_router) = build_router(&new_conf) {
+                        hot_reload_router.store(Arc::new(new_router));
+                        info!("✅ Hot reload successful! Routing table updated atomically.");
+                    } else {
+                        warn!("⚠️ New config has no valid routes. Keeping old routing table.");
                     }
                 }
+                Err(e) => {
+                    error!("❌ Failed to parse new config during hot reload: {}", e);
+                }
             }
-        });
+        }
     });
 
     // 5. ІНІЦІАЛІЗАЦІЯ СЕРВІСУ
@@ -230,10 +226,11 @@ fn main() {
 
     troodon_server.add_service(lb_service);
 
-    // 8. PROMETHEUS
+    // 8. PROMETHEUS METRICS (опціонально)
     if let Some(prom_port) = server_config.prometheus_port {
         let mut prom_service = Service::prometheus_http_service();
-        let prom_addr = format!("{}:{}", server_config.listen_addr, prom_port);
+        let prom_addr = format!("{}:{}", server_config.prometheus_listen_addr, prom_port);
+        info!("📊 Prometheus metrics exposed locally on http://{}/metrics", prom_addr);
         prom_service.add_tcp(&prom_addr);
         troodon_server.add_service(prom_service);
         info!("📊 Prometheus metrics exposed on TCP: {}", prom_addr);

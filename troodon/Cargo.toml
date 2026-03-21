@@ -26,7 +26,6 @@ log = "0.4"
 # === Configuration (YAML Parsing) ===
 # serde - це фреймворк серіалізації (як encoding/json в Go)
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
 
 # === Error Handling ===
 # Щоб простіше повертати помилки (Result<T, anyhow::Error>)
@@ -39,6 +38,11 @@ prometheus = { version = "0.13", default-features = false }
 bytes = "1.11.1"
 openssl = { version = "0.10.75", features = ["v102", "v110"] }
 ipnet = "2.12.0"
+serde_yml = "0.0.12"
+fastrand = "2.3.0"
+ip_network_table = "0.2.0"
+signal-hook = "0.4.3"
+ip_network = "0.4.1"
 
 [dev-dependencies]
 reqwest = "0.12"

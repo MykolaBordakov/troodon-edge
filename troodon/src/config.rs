@@ -34,6 +34,13 @@ pub struct ServerConfig {
 
     // Порт для експорту метрик Prometheus (опціонально)
     pub prometheus_port: Option<u16>,
+
+    #[serde(default = "default_prom_addr")]
+    pub prometheus_listen_addr: String,
+}
+
+fn default_prom_addr() -> String {
+    "127.0.0.1".to_string()
 }
 
 fn default_log_level() -> String {
@@ -149,6 +156,8 @@ pub struct Location {
 
     // Шлях для Active Health Check (якщо None, тоді Active Health Check вимкнено)
     pub health_check_path: Option<String>,
+    // Rate limit per IP (requests per second)
+    pub req_per_sec: Option<isize>,
 
     // Кількість спроб повтору запиту (Retries), якщо бекенд лежить (0 = не ретраїти)
     #[serde(default)]
@@ -182,9 +191,151 @@ fn default_host_path() -> String {
     "/".to_string()
 }
 
-// --- LOADER ---
+// --- LOADER + VALIDATOR ---
+
+/// Завантажує і валідує конфігурацію.
+/// Помилки валідації — зрозумілі повідомлення з конкретним полем.
 pub fn load_config(path: &str) -> Result<Config, anyhow::Error> {
     let f = std::fs::File::open(path)?;
-    let config: Config = serde_yaml::from_reader(f)?;
+    let config: Config = serde_yml::from_reader(f)?;
+    validate(&config)?;
     Ok(config)
+}
+
+/// Семантична валідація конфігурації.
+/// Викликається при старті та при hot reload.
+pub fn validate(config: &Config) -> Result<(), anyhow::Error> {
+    // 1. listen_addr має бути валідною IP-адресою
+    config
+        .server
+        .listen_addr
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Invalid listen_addr '{}': must be a valid IP address (e.g. '0.0.0.0' or '127.0.0.1')",
+                config.server.listen_addr
+            )
+        })?;
+
+    // 2. log_level має бути одним з допустимих значень
+    let valid_levels = ["trace", "debug", "info", "warn", "error"];
+    if !valid_levels.contains(&config.server.log_level.to_lowercase().as_str()) {
+        return Err(anyhow::anyhow!(
+            "Invalid log_level '{}': must be one of {:?}",
+            config.server.log_level,
+            valid_levels
+        ));
+    }
+
+    // 3. Всі timeout поля мають бути > 0
+    let t = &config.server.timeouts;
+    if t.connect == 0 || t.read == 0 || t.write == 0 || t.idle == 0 {
+        return Err(anyhow::anyhow!(
+            "All server timeouts must be > 0. Got: connect={}, read={}, write={}, idle={}",
+            t.connect, t.read, t.write, t.idle
+        ));
+    }
+
+    // 4. Перевірка конфліктів портів
+    let listen_port = config.server.listen_port;
+    if let Some(tls_port) = config.tls_port {
+        if tls_port == listen_port {
+            return Err(anyhow::anyhow!(
+                "Port conflict: tls_port ({}) cannot equal listen_port ({})",
+                tls_port, listen_port
+            ));
+        }
+        if let Some(prom_port) = config.server.prometheus_port {
+            if prom_port == tls_port {
+                return Err(anyhow::anyhow!(
+                    "Port conflict: prometheus_port ({}) cannot equal tls_port ({})",
+                    prom_port, tls_port
+                ));
+            }
+        }
+    }
+    if let Some(prom_port) = config.server.prometheus_port {
+        if prom_port == listen_port {
+            return Err(anyhow::anyhow!(
+                "Port conflict: prometheus_port ({}) cannot equal listen_port ({})",
+                prom_port, listen_port
+            ));
+        }
+    }
+
+    // 5. Перевірка ip_access_control default_action
+    if let Some(ref iac) = config.server.ip_access_control {
+        let action = iac.default_action.to_lowercase();
+        if action != "allow" && action != "deny" {
+            return Err(anyhow::anyhow!(
+                "Invalid ip_access_control.default_action '{}': must be 'allow' or 'deny'",
+                iac.default_action
+            ));
+        }
+    }
+
+    // 6. Перевіряємо маршрути
+    if config.routes.is_empty() {
+        return Err(anyhow::anyhow!("Configuration must define at least one route"));
+    }
+
+    for route in &config.routes {
+        // 6a. per-route ip_access_control default_action
+        if let Some(ref iac) = route.ip_access_control {
+            let action = iac.default_action.to_lowercase();
+            if action != "allow" && action != "deny" {
+                return Err(anyhow::anyhow!(
+                    "Invalid ip_access_control.default_action '{}' for route host='{}': must be 'allow' or 'deny'",
+                    iac.default_action, route.host
+                ));
+            }
+        }
+
+        // 6b. TLS cert/key файли мають існувати
+        if let Some(ref tls) = route.tls {
+            if !std::path::Path::new(&tls.cert).exists() {
+                return Err(anyhow::anyhow!(
+                    "TLS cert file not found for host '{}': '{}'",
+                    route.host, tls.cert
+                ));
+            }
+            if !std::path::Path::new(&tls.key).exists() {
+                return Err(anyhow::anyhow!(
+                    "TLS key file not found for host '{}': '{}'",
+                    route.host, tls.key
+                ));
+            }
+            // 6c. Якщо mTLS enabled — client_ca теж має існувати
+            if let Some(ref mtls) = tls.mtls {
+                if mtls.enabled {
+                    let ca = mtls.client_ca.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mTLS is enabled for host '{}' but client_ca is not set",
+                            route.host
+                        )
+                    })?;
+                    if !std::path::Path::new(ca).exists() {
+                        return Err(anyhow::anyhow!(
+                            "mTLS client_ca file not found for host '{}': '{}'",
+                            route.host, ca
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 6d. location timeouts
+        for loc in &route.locations {
+            if let Some(ref lt) = loc.timeouts {
+                if lt.connect == 0 || lt.read == 0 || lt.write == 0 || lt.idle == 0 {
+                    return Err(anyhow::anyhow!(
+                        "All timeouts in location '{}' (host='{}') must be > 0",
+                        loc.path, route.host
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

@@ -1,15 +1,17 @@
-use ipnet::IpNet;
+use ip_network_table::IpNetworkTable;
+use ip_network::IpNetwork;
 use std::net::IpAddr;
+use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 use crate::config::IpAccessControl;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct IpFilter {
     pub enabled: bool,
     default_action: String,
-    whitelist: Vec<IpNet>,
-    blacklist: Vec<IpNet>,
+    whitelist: Arc<IpNetworkTable<()>>,
+    blacklist: Arc<IpNetworkTable<()>>,
 }
 
 impl IpFilter {
@@ -18,33 +20,27 @@ impl IpFilter {
             return Self {
                 enabled: false,
                 default_action: String::new(),
-                whitelist: Vec::new(),
-                blacklist: Vec::new(),
+                whitelist: Arc::new(IpNetworkTable::new()),
+                blacklist: Arc::new(IpNetworkTable::new()),
             };
         }
 
-        let parse_nets = |nets: &[String], list_name: &str| -> Vec<IpNet> {
-            nets.iter()
-                .filter_map(|s| {
-                    // Try to parse as a CIDR network ("192.168.1.0/24")
-                    match s.parse::<IpNet>() {
-                        Ok(net) => Some(net),
-                        Err(_) => {
-                            // If it's a single IP ("192.168.1.100"), convert it to /32 or /128
-                            match s.parse::<IpAddr>() {
-                                Ok(ip) => Some(IpNet::from(ip)),
-                                Err(e) => {
-                                    error!(
-                                        "Failed to parse IP/CIDR in {}: '{}' - {}",
-                                        list_name, s, e
-                                    );
-                                    None
-                                }
-                            }
+        let parse_nets = |nets: &[String], list_name: &str| -> Arc<IpNetworkTable<()>> {
+            let mut table = IpNetworkTable::new();
+            for s in nets {
+                let net = match s.parse::<IpNetwork>() {
+                    Ok(net) => net,
+                    Err(_) => match s.parse::<IpAddr>() {
+                        Ok(ip) => IpNetwork::from(ip),
+                        Err(e) => {
+                            error!("Failed to parse IP/CIDR in {}: '{}' - {}", list_name, s, e);
+                            continue;
                         }
-                    }
-                })
-                .collect()
+                    },
+                };
+                table.insert(net, ());
+            }
+            Arc::new(table)
         };
 
         Self {
@@ -67,13 +63,13 @@ impl IpFilter {
         }
 
         // 1. Whitelist has highest priority
-        if self.whitelist.iter().any(|net| net.contains(ip)) {
+        if self.whitelist.longest_match(*ip).is_some() {
             debug!("IP {} allowed by whitelist", ip);
             return true;
         }
 
         // 2. Blacklist check
-        if self.blacklist.iter().any(|net| net.contains(ip)) {
+        if self.blacklist.longest_match(*ip).is_some() {
             warn!("IP {} blocked by blacklist", ip);
             return false;
         }
